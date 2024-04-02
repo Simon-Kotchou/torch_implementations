@@ -104,6 +104,186 @@ def compute_stability(condensed_tree):
 
     return dict(zip(torch.unique(condensed_tree[:, 0]).tolist(), stability_scores.tolist()))
 
+def bfs_from_cluster_tree(tree, bfs_root):
+    result = []
+    to_process = torch.tensor([bfs_root], dtype=torch.long)
+
+    while to_process.shape[0] > 0:
+        result.extend(to_process.tolist())
+        to_process = tree[tree[:, 0].isin(to_process), 1]
+
+    return result
+
+def max_lambdas(tree):
+    largest_parent = tree[:, 0].max().item()
+    deaths = torch.zeros(largest_parent + 1, dtype=torch.double)
+
+    sorted_parent_data, _ = torch.sort(tree[:, [0, 2]], dim=0)
+    sorted_parents = sorted_parent_data[:, 0]
+    sorted_lambdas = sorted_parent_data[:, 1]
+
+    current_parent = -1
+    max_lambda = 0
+
+    for row in range(sorted_parent_data.shape[0]):
+        parent = sorted_parents[row].item()
+        lambda_ = sorted_lambdas[row].item()
+
+        if parent == current_parent:
+            max_lambda = max(max_lambda, lambda_)
+        elif current_parent != -1:
+            deaths[current_parent] = max_lambda
+            current_parent = parent
+            max_lambda = lambda_
+        else:
+            current_parent = parent
+            max_lambda = lambda_
+
+    deaths[current_parent] = max_lambda
+
+    return deaths
+
+
+class TreeUnionFind:
+    def __init__(self, size):
+        self._data = torch.zeros((size, 2), dtype=torch.long)
+        self._data[:, 0] = torch.arange(size)
+        self.is_component = torch.ones(size, dtype=torch.bool)
+
+    def union(self, x, y):
+        x_root = self.find(x)
+        y_root = self.find(y)
+
+        if self._data[x_root, 1] < self._data[y_root, 1]:
+            self._data[x_root, 0] = y_root
+        elif self._data[x_root, 1] > self._data[y_root, 1]:
+            self._data[y_root, 0] = x_root
+        else:
+            self._data[y_root, 0] = x_root
+            self._data[x_root, 1] += 1
+
+    def find(self, x):
+        if self._data[x, 0] != x:
+            self._data[x, 0] = self.find(self._data[x, 0])
+            self.is_component[x] = False
+        return self._data[x, 0]
+
+    def components(self):
+        return self.is_component.nonzero().squeeze()
+
+
+def labelling_at_cut(linkage, cut, min_cluster_size):
+    root = 2 * linkage.shape[0]
+    num_points = root // 2 + 1
+
+    result = torch.full((num_points,), -1, dtype=torch.long)
+    union_find = TreeUnionFind(root + 1)
+
+    cluster = num_points
+    for row in linkage:
+        if row[2] < cut:
+            union_find.union(row[0].item(), cluster)
+            union_find.union(row[1].item(), cluster)
+        cluster += 1
+
+    cluster_size = torch.zeros(cluster, dtype=torch.long)
+    for n in range(num_points):
+        cluster = union_find.find(n)
+        cluster_size[cluster] += 1
+        result[n] = cluster
+
+    unique_labels = result.unique()
+    cluster_label_map = {-1: -1}
+    cluster_label = 0
+
+    for cluster in unique_labels:
+        if cluster_size[cluster] < min_cluster_size:
+            cluster_label_map[cluster.item()] = -1
+        else:
+            cluster_label_map[cluster.item()] = cluster_label
+            cluster_label += 1
+
+    for n in range(num_points):
+        result[n] = cluster_label_map[result[n].item()]
+
+    return result
+
+
+def do_labelling(tree, clusters, cluster_label_map, allow_single_cluster, cluster_selection_epsilon, match_reference_implementation):
+    child_array = tree[:, 1]
+    parent_array = tree[:, 0]
+    lambda_array = tree[:, 2]
+
+    root_cluster = parent_array.min().item()
+    result = torch.full((root_cluster,), -1, dtype=torch.long)
+    union_find = TreeUnionFind(parent_array.max().item() + 1)
+
+    for n in range(tree.shape[0]):
+        child = child_array[n].item()
+        parent = parent_array[n].item()
+        if child not in clusters:
+            union_find.union(parent, child)
+
+    for n in range(root_cluster):
+        cluster = union_find.find(n)
+        if cluster < root_cluster:
+            result[n] = -1
+        elif cluster == root_cluster:
+            if len(clusters) == 1 and allow_single_cluster:
+                if cluster_selection_epsilon != 0.0:
+                    if lambda_array[child_array == n][0] >= 1 / cluster_selection_epsilon:
+                        result[n] = cluster_label_map[cluster]
+                    else:
+                        result[n] = -1
+                elif lambda_array[child_array == n][0] >= lambda_array[parent_array == cluster].max():
+                    result[n] = cluster_label_map[cluster]
+                else:
+                    result[n] = -1
+            else:
+                result[n] = -1
+        else:
+            if match_reference_implementation:
+                point_lambda = lambda_array[child_array == n][0].item()
+                cluster_lambda = lambda_array[child_array == cluster][0].item()
+                if point_lambda > cluster_lambda:
+                    result[n] = cluster_label_map[cluster]
+                else:
+                    result[n] = -1
+            else:
+                result[n] = cluster_label_map[cluster]
+
+    return result
+
+
+def get_probabilities(tree, cluster_map, labels):
+    child_array = tree[:, 1]
+    parent_array = tree[:, 0]
+    lambda_array = tree[:, 2]
+
+    result = torch.zeros(labels.shape[0], dtype=torch.double)
+    deaths = max_lambdas(tree)
+    root_cluster = parent_array.min().item()
+
+    for n in range(tree.shape[0]):
+        point = child_array[n].item()
+        if point >= root_cluster:
+            continue
+
+        cluster_num = labels[point].item()
+
+        if cluster_num == -1:
+            continue
+
+        cluster = cluster_map[cluster_num]
+        max_lambda = deaths[cluster].item()
+        if max_lambda == 0.0 or not torch.isfinite(lambda_array[n]):
+            result[point] = 1.0
+        else:
+            lambda_ = min(lambda_array[n].item(), max_lambda)
+            result[point] = lambda_ / max_lambda
+
+    return result
+
 
 def labelling_at_cut(linkage, cut, min_cluster_size):
     """
@@ -153,6 +333,61 @@ def outlier_scores(tree):
                 result[point] = (max_lambda - lambdas[n]) / max_lambda
 
     return result
+
+def recurse_leaf_dfs(cluster_tree, current_node):
+    children = cluster_tree[cluster_tree[:, 0] == current_node, 1]
+
+    if children.numel() == 0:
+        return [current_node]
+    else:
+        return sum([recurse_leaf_dfs(cluster_tree, child.item()) for child in children], [])
+
+
+def get_cluster_tree_leaves(cluster_tree):
+    if cluster_tree.shape[0] == 0:
+        return []
+
+    root = cluster_tree[:, 0].min().item()
+    return recurse_leaf_dfs(cluster_tree, root)
+
+
+def traverse_upwards(cluster_tree, cluster_selection_epsilon, leaf, allow_single_cluster):
+    root = cluster_tree[:, 0].min().item()
+    parent = cluster_tree[cluster_tree[:, 1] == leaf, 0].item()
+
+    if parent == root:
+        if allow_single_cluster:
+            return parent
+        else:
+            return leaf  # return node closest to root
+
+    parent_eps = 1 / cluster_tree[cluster_tree[:, 1] == parent, 2].item()
+
+    if parent_eps > cluster_selection_epsilon:
+        return parent
+    else:
+        return traverse_upwards(cluster_tree, cluster_selection_epsilon, parent, allow_single_cluster)
+
+
+def epsilon_search(leaves, cluster_tree, cluster_selection_epsilon, allow_single_cluster):
+    selected_clusters = []
+    processed = []
+
+    for leaf in leaves:
+        eps = 1 / cluster_tree[cluster_tree[:, 1] == leaf, 2].item()
+
+        if eps < cluster_selection_epsilon:
+            if leaf not in processed:
+                epsilon_child = traverse_upwards(cluster_tree, cluster_selection_epsilon, leaf, allow_single_cluster)
+                selected_clusters.append(epsilon_child)
+
+                for sub_node in bfs_from_cluster_tree(cluster_tree, epsilon_child):
+                    if sub_node != epsilon_child:
+                        processed.append(sub_node.item())
+        else:
+            selected_clusters.append(leaf)
+
+    return set(selected_clusters)
 
 
 def get_clusters(tree, stability, cluster_selection_method='eom', allow_single_cluster=False, match_reference_implementation=False):
