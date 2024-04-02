@@ -7,24 +7,20 @@ class BoruvkaUnionFind:
         self.is_component = torch.ones(size, dtype=bool)
 
     def find(self, x):
-        if self.parent[x] != x:
-            self.parent[x] = self.find(self.parent[x])
+        mask = self.parent[x] != x
+        self.parent[x][mask] = self.find(self.parent[x][mask])
         return self.parent[x]
 
     def union(self, x, y):
         root_x, root_y = self.find(x), self.find(y)
-        if root_x == root_y:
-            return
-        if self.rank[root_x] < self.rank[root_y]:
-            self.parent[root_x] = root_y
-            self.is_component[root_x] = False
-        elif self.rank[root_x] > self.rank[root_y]:
-            self.parent[root_y] = root_x
-            self.is_component[root_y] = False
-        else:
-            self.parent[root_y] = root_x
-            self.rank[root_x] += 1
-            self.is_component[root_y] = False
+        mask = root_x != root_y
+        x, y = x[mask], y[mask]
+        root_x, root_y = root_x[mask], root_y[mask]
+
+        self.is_component[root_x] = self.is_component[root_y] = False
+        self.parent[root_x] = torch.where(self.rank[root_x] < self.rank[root_y], root_y, root_x)
+        self.parent[root_y] = torch.where(self.rank[root_x] > self.rank[root_y], root_x, root_y)
+        self.rank[root_x] += (self.rank[root_x] == self.rank[root_y]).long()
 
     def components(self):
         return self.is_component.nonzero().view(-1)
@@ -57,62 +53,65 @@ class KDTreeBoruvkaAlgorithm:
         self._initialize_components()
         self._compute_bounds()
 
+    @torch.jit.script_method
     def _compute_bounds(self):
-        knn_dist, knn_indices = self.tree.query(self.tree.data, k=self.min_samples + 1)
+        knn_dist, knn_indices = torch.jit.annotate(List[Tensor], self.tree.query(self.tree.data, k=self.min_samples + 1))
         self.core_distance = knn_dist[:, -1]
         
-        for i in range(self.n_points):
-            for j in range(self.min_samples + 1):
-                if knn_indices[i, j] == i:
-                    continue
-                if self.core_distance[knn_indices[i, j]] <= self.core_distance[i]:
-                    self.candidate_point[i] = i
-                    self.candidate_neighbor[i] = knn_indices[i, j]
-                    self.candidate_distance[i] = self.core_distance[i]
-                    break
+        mask = (knn_indices != torch.arange(self.n_points).unsqueeze(1)).any(1)
+        self.candidate_point = torch.where(mask, torch.arange(self.n_points), -1)
+        self.candidate_neighbor = knn_indices[torch.arange(self.n_points), (self.core_distance[knn_indices] <= self.core_distance.unsqueeze(1)).argmax(1)]
+        self.candidate_distance = torch.where(mask, self.core_distance, float('inf'))
 
         self.update_components()
 
+    @torch.jit.script_method
     def _initialize_components(self):
         self.component_of_point[:] = torch.arange(self.n_points)
         self.component_of_node[:] = -torch.arange(1, self.n_nodes + 1)
 
+    @torch.jit.script_method
     def update_components(self):
-        for c in self.components:
-            source, sink = self.candidate_point[c], self.candidate_neighbor[c]
-            if source == -1 or sink == -1:
-                continue
-            if self.component_union_find.find(source) == self.component_union_find.find(sink):
-                self.candidate_point[c] = self.candidate_neighbor[c] = -1
-                self.candidate_distance[c] = float('inf')
-                continue
-            self.edges[self.num_edges] = torch.tensor([source, sink, self.candidate_distance[c]])
-            self.num_edges += 1
+        is_source = self.candidate_point != -1
+        is_sink = self.candidate_neighbor != -1
+        source, sink = self.candidate_point[is_source], self.candidate_neighbor[is_sink]
+        
+        source_component = self.component_union_find.find(source)
+        sink_component = self.component_union_find.find(sink)
+        
+        is_same_component = source_component == sink_component
+        source, sink = source[~is_same_component], sink[~is_same_component]
+        self.edges[self.num_edges:self.num_edges+len(source)] = torch.stack([source, sink, self.candidate_distance[is_source][~is_same_component]], dim=1)
+        self.num_edges += len(source)
+        
+        self.component_union_find.union(source, sink)
+            
+        if self.num_edges == self.n_points - 1:
+            self.components = self.component_union_find.components()
+            return len(self.components)
 
-            self.component_union_find.union(source, sink)
+        self.component_of_point = torch.tensor([self.component_union_find.find(i) for i in range(self.n_points)])
 
-            if self.num_edges == self.n_points - 1:
-                self.components = self.component_union_find.components()
-                return len(self.components)
-
-        self.component_of_point[:] = torch.tensor([self.component_union_find.find(i) for i in range(self.n_points)])
-
+        is_leaf = self.tree.node_data[:, 2].bool()
+        leaf_start = self.tree.node_data[is_leaf, 0].long()
+        leaf_end = self.tree.node_data[is_leaf, 1].long()
+        leaf_component = self.component_of_point[self.tree.idx_array[leaf_start]]
+        is_same_leaf_component = (self.component_of_point[self.tree.idx_array[leaf_start[:, None], leaf_end[None, :]]] == leaf_component[:, None]).all(1)
+        self.component_of_node[is_leaf] = torch.where(is_same_leaf_component, leaf_component, -1)
+        
         for n in range(self.n_nodes - 1, -1, -1):
-            if self.tree.node_data[n, 2]:  # is_leaf
-                c = self.component_of_point[self.tree.idx_array[self.tree.node_data[n, 0]]]
-                if (self.component_of_point[self.tree.idx_array[self.tree.node_data[n, 0]:self.tree.node_data[n, 1]]] == c).all():
-                    self.component_of_node[n] = c
-            else:
+            if not is_leaf[n]:
                 if self.component_of_node[2 * n + 1] == self.component_of_node[2 * n + 2]:
                     self.component_of_node[n] = self.component_of_node[2 * n + 1]
 
         if self.approx_min_span_tree and len(self.components) == len(self.component_union_find.components()):
-            self.bounds[:] = float('inf')
+            self.bounds[~is_leaf] = float('inf')
         else:
-            self.bounds[:] = float('inf')
-
+            self.bounds[~is_leaf] = float('inf')
+            
         return len(self.components)
 
+    @torch.jit.script_method
     def dual_tree_traversal(self, node1, node2):
         node1_info, node2_info = self.tree.node_data[node1], self.tree.node_data[node2]
         
@@ -124,15 +123,20 @@ class KDTreeBoruvkaAlgorithm:
         if node1_info[2] and node2_info[2]:  # Both nodes are leaves
             point_indices1 = self.tree.idx_array[node1_info[0]:node1_info[1]]
             point_indices2 = self.tree.idx_array[node2_info[0]:node2_info[1]]
-            for i in point_indices1:
-                for j in point_indices2:
-                    if self.component_of_point[i] == self.component_of_point[j]:
-                        continue
-                    d = self.tree.dist(self.tree.data[i], self.tree.data[j])
-                    if d < self.candidate_distance[self.component_of_point[i]]:
-                        self.candidate_distance[self.component_of_point[i]] = d
-                        self.candidate_neighbor[self.component_of_point[i]] = j
-                        self.candidate_point[self.component_of_point[i]] = i
+            i, j = torch.meshgrid(point_indices1, point_indices2)
+            dists = self.tree.dist(self.tree.data[i], self.tree.data[j])
+            components_i = self.component_of_point[i]
+            components_j = self.component_of_point[j]
+            mask = components_i != components_j
+            dists = dists[mask]
+            if not dists.numel():
+                return
+            min_dist, min_idx = dists.min(0)
+            min_i, min_j = i[mask][min_idx], j[mask][min_idx]
+            mask = min_dist < self.candidate_distance[components_i[mask][min_idx]]
+            self.candidate_distance[components_i[mask][min_idx]] = min_dist[mask]
+            self.candidate_neighbor[components_i[mask][min_idx]] = min_j[mask]
+            self.candidate_point[components_i[mask][min_idx]] = min_i[mask]
         elif node1_info[2] or (not node2_info[2] and node2_info[3] > node1_info[3]):
             self.dual_tree_traversal(node1, 2 * node2 + 1)
             self.dual_tree_traversal(node1, 2 * node2 + 2)
@@ -140,6 +144,7 @@ class KDTreeBoruvkaAlgorithm:
             self.dual_tree_traversal(2 * node1 + 1, node2)
             self.dual_tree_traversal(2 * node1 + 2, node2)
 
+    @torch.jit.script_method
     def spanning_tree(self):
         while len(self.components) > 1:
             self.dual_tree_traversal(0, 0)
