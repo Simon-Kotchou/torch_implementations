@@ -116,3 +116,43 @@ class ViT(nn.Module):
         logits = self.fc(cls_output)
         
         return logits
+    
+# Masking function
+def generate_mask(image_size, patch_size, mask_ratio):
+    num_patches = (image_size // patch_size) ** 2
+    num_mask = int(mask_ratio * num_patches)
+    
+    mask = torch.ones(num_patches, dtype=torch.bool)
+    mask_indices = torch.randperm(num_patches)[:num_mask]
+    mask[mask_indices] = False
+    
+    return mask
+
+# I-JEPA model
+class IJEPA(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, d_model, num_heads, num_layers, d_ff, dropout=0.1):
+        super().__init__()
+        self.student = ViT(image_size, patch_size, num_classes, d_model, num_heads, num_layers, d_ff, dropout)
+        self.teacher = ViT(image_size, patch_size, num_classes, d_model, num_heads, num_layers, d_ff, dropout)
+        self.predictor = nn.Linear(d_model, d_model)
+        
+        # Initialize teacher with student weights
+        self.teacher.load_state_dict(self.student.state_dict())
+        
+    def forward(self, x, mask):
+        # Student forward pass
+        student_output = self.student(x)
+        
+        # Teacher forward pass with EMA
+        with torch.no_grad():
+            teacher_output = self.teacher(x)
+        
+        # Predictor
+        predicted_teacher_output = self.predictor(student_output)
+        
+        return predicted_teacher_output, teacher_output
+    
+    def update_teacher(self, momentum=0.996):
+        for param_student, param_teacher in zip(self.student.parameters(), self.teacher.parameters()):
+            param_teacher.data = param_teacher.data * momentum + param_student.data * (1 - momentum)
+            
