@@ -31,12 +31,13 @@ class BSpline(nn.Module):
         return output
 
 class KAN(nn.Module):
-    def __init__(self, input_dim, hidden_widths, num_bases, degree, domain=(0, 1)):
+    def __init__(self, input_dim, hidden_widths, num_bases, degree, domain=(0, 1), sparsity_reg=1e-5):
         super(KAN, self).__init__()
         self.input_dim = input_dim
         self.hidden_widths = hidden_widths
         self.num_layers = len(hidden_widths)
         self.domain = domain
+        self.sparsity_reg = sparsity_reg
         
         self.edge_activations = nn.ModuleList()
         for i in range(self.num_layers):
@@ -65,6 +66,30 @@ class KAN(nn.Module):
             activations = torch.sum(activations, dim=1)
         return activations.squeeze()
     
+    def sparsity_loss(self):
+        sparsity_loss = 0
+        for layer_activations in self.edge_activations:
+            for activation_func in layer_activations:
+                sparsity_loss += torch.mean(torch.abs(activation_func.coefficients))
+        return sparsity_loss
+    
+    def prune_edges(self, threshold):
+        for layer_activations in self.edge_activations:
+            for activation_func in layer_activations:
+                activation_func.coefficients.data = torch.where(torch.abs(activation_func.coefficients) > threshold,
+                                                                activation_func.coefficients,
+                                                                torch.zeros_like(activation_func.coefficients))
+    
     def prune_nodes(self, threshold):
         for i in range(self.num_layers):
             self.pruning_mask[i].data = (torch.abs(self.pruning_mask[i]) > threshold).float()
+
+def train(model, dataloader, criterion, optimizer, num_epochs, sparsity_reg):
+    for epoch in range(num_epochs):
+        for inputs, targets in dataloader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets) + sparsity_reg * model.sparsity_loss()
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
