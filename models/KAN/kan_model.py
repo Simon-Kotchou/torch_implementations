@@ -29,3 +29,42 @@ class BSpline(nn.Module):
         basis_values = bspline_basis(x, self.degree, self.knots)
         output = torch.matmul(basis_values, self.coefficients)
         return output
+
+class KAN(nn.Module):
+    def __init__(self, input_dim, hidden_widths, num_bases, degree, domain=(0, 1)):
+        super(KAN, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_widths = hidden_widths
+        self.num_layers = len(hidden_widths)
+        self.domain = domain
+        
+        self.edge_activations = nn.ModuleList()
+        for i in range(self.num_layers):
+            if i == 0:
+                layer_input_dim = input_dim
+            else:
+                layer_input_dim = hidden_widths[i-1]
+            
+            layer_output_dim = hidden_widths[i]
+            layer_activations = nn.ModuleList([BSpline(num_bases, degree, domain) for _ in range(layer_input_dim * layer_output_dim)])
+            self.edge_activations.append(layer_activations)
+        
+        self.pruning_mask = nn.ParameterList([nn.Parameter(torch.ones(hidden_widths[i]), requires_grad=False) for i in range(self.num_layers)])
+        
+    def forward(self, x):
+        activations = x
+        for layer_idx, layer_activations in enumerate(self.edge_activations):
+            layer_outputs = []
+            for i in range(activations.shape[1]):
+                for j in range(self.hidden_widths[layer_idx]):
+                    edge_idx = i * self.hidden_widths[layer_idx] + j
+                    output = layer_activations[edge_idx](activations[:, i]) * self.pruning_mask[layer_idx][j]
+                    layer_outputs.append(output)
+            activations = torch.stack(layer_outputs, dim=1)
+            activations = activations.view(activations.shape[0], -1, self.hidden_widths[layer_idx])
+            activations = torch.sum(activations, dim=1)
+        return activations.squeeze()
+    
+    def prune_nodes(self, threshold):
+        for i in range(self.num_layers):
+            self.pruning_mask[i].data = (torch.abs(self.pruning_mask[i]) > threshold).float()
