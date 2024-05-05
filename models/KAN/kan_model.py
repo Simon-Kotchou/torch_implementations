@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
 
 def bspline_basis(x, degree, knots):
     if degree == 0:
@@ -84,8 +85,14 @@ class KAN(nn.Module):
         for i in range(self.num_layers):
             self.pruning_mask[i].data = (torch.abs(self.pruning_mask[i]) > threshold).float()
 
-def train(model, dataloader, criterion, optimizer, num_epochs, sparsity_reg):
+def train(model, dataloader, criterion, optimizer, num_epochs, sparsity_reg, base_schedule, degree_schedule):
     for epoch in range(num_epochs):
+        # Update the number of bases and degree according to the schedule
+        if epoch in base_schedule:
+            model.update_bases(base_schedule[epoch])
+        if epoch in degree_schedule:
+            model.update_degree(degree_schedule[epoch])
+        
         for inputs, targets in dataloader:
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -93,3 +100,33 @@ def train(model, dataloader, criterion, optimizer, num_epochs, sparsity_reg):
             loss.backward()
             optimizer.step()
         print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
+
+def evaluate(model, criterion, dataloader):
+    model.eval()
+    with torch.no_grad():
+        total_loss = 0
+        total_samples = 0
+        for inputs, targets in dataloader:
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            total_loss += loss.item() * inputs.size(0)
+            total_samples += inputs.size(0)
+        avg_loss = total_loss / total_samples
+    return avg_loss
+
+def visualize_edge_activations(model):
+    for layer_idx, layer_activations in enumerate(model.edge_activations):
+        for edge_idx, activation_func in enumerate(layer_activations):
+            x = torch.linspace(model.domain[0], model.domain[1], 100)
+            y = activation_func(x)
+            plt.plot(x.detach().numpy(), y.detach().numpy(), label=f"Layer {layer_idx}, Edge {edge_idx}")
+    plt.legend()
+    plt.show()
+
+def analyze_edge_importance(model):
+    edge_importance = []
+    for layer_activations in model.edge_activations:
+        for activation_func in layer_activations:
+            importance = torch.mean(torch.abs(activation_func.coefficients)).item()
+            edge_importance.append(importance)
+    return edge_importance
