@@ -147,3 +147,23 @@ class LinearKAN(nn.Module):
                 output += self.activation_functions[idx](x[:, j])
             outputs.append(output)
         return torch.stack(outputs, dim=1)
+    
+class ConvolutionalKAN(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, num_bases, degree):
+        super(ConvolutionalKAN, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.activation_functions = nn.ModuleList([BSpline(num_bases, degree) for _ in range(in_channels * out_channels * kernel_size * kernel_size)])
+        
+    def forward(self, x):
+        outputs = []
+        for i in range(self.out_channels):
+            output = torch.zeros(x.shape[0], x.shape[2] - self.kernel_size + 1, x.shape[3] - self.kernel_size + 1)
+            for j in range(self.in_channels):
+                for k in range(self.kernel_size):
+                    for l in range(self.kernel_size):
+                        idx = (i * self.in_channels + j) * self.kernel_size * self.kernel_size + k * self.kernel_size + l
+                        output += self.activation_functions[idx](x[:, j, k:k+x.shape[2]-self.kernel_size+1, l:l+x.shape[3]-self.kernel_size+1])
+            outputs.append(output)
+        return torch.stack(outputs, dim=1)
