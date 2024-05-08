@@ -130,3 +130,20 @@ def analyze_edge_importance(model):
             importance = torch.mean(torch.abs(activation_func.coefficients)).item()
             edge_importance.append(importance)
     return edge_importance
+
+class LinearKAN(nn.Module):
+    def __init__(self, in_features, out_features, num_bases, degree):
+        super(LinearKAN, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.activation_functions = nn.ModuleList([BSpline(num_bases, degree) for _ in range(in_features * out_features)])
+        
+    def forward(self, x):
+        outputs = []
+        for i in range(self.out_features):
+            output = 0
+            for j in range(self.in_features):
+                idx = i * self.in_features + j
+                output += self.activation_functions[idx](x[:, j])
+            outputs.append(output)
+        return torch.stack(outputs, dim=1)
