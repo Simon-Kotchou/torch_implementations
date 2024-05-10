@@ -2,10 +2,10 @@ from typing import List, Optional, Union
 
 import numpy as np
 
-from ...audio_utils import mel_filter_bank, spectrogram, window_function
-from ...feature_extraction_sequence_utils import SequenceFeatureExtractor
-from ...feature_extraction_utils import BatchFeature
-from ...utils import TensorType, is_speech_available, is_torch_available, logging
+from transformers.audio_utils import mel_filter_bank, spectrogram, window_function
+from transformers.feature_extraction_sequence_utils import SequenceFeatureExtractor
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.utils import TensorType, is_speech_available, is_torch_available, logging
 
 
 if is_speech_available():
@@ -18,9 +18,9 @@ if is_torch_available():
 logger = logging.get_logger(__name__)
 
 
-class ASTFeatureExtractor(SequenceFeatureExtractor):
+class SSASTFeatureExtractor(SequenceFeatureExtractor):
     r"""
-    Constructs a Audio Spectrogram Transformer (AST) feature extractor.
+    Constructs a Self Supervised Audio Spectrogram Transformer (SSAST) feature extractor.
 
     This feature extractor inherits from [`~feature_extraction_sequence_utils.SequenceFeatureExtractor`] which contains
     most of the main methods. Users should refer to this superclass for more information regarding those methods.
@@ -45,7 +45,7 @@ class ASTFeatureExtractor(SequenceFeatureExtractor):
             The standard deviation value used to normalize the log-Mel features. Uses the AudioSet standard deviation
             by default.
         return_attention_mask (`bool`, *optional*, defaults to `False`):
-            Whether or not [`~ASTFeatureExtractor.__call__`] should return `attention_mask`.
+            Whether or not [`~SSASTFeatureExtractor.__call__`] should return `attention_mask`.
     """
 
     model_input_names = ["input_values", "attention_mask"]
@@ -61,9 +61,6 @@ class ASTFeatureExtractor(SequenceFeatureExtractor):
         mean=-4.2677393,
         std=4.5689974,
         return_attention_mask=False,
-        apply_spec_augment=False,  # New parameter for SpecAugment
-        freq_mask_param=27,  # Default parameters for frequency masking
-        time_mask_param=100,  # Default parameters for time masking
         **kwargs,
     ):
         super().__init__(feature_size=feature_size, sampling_rate=sampling_rate, padding_value=padding_value, **kwargs)
@@ -125,15 +122,6 @@ class ASTFeatureExtractor(SequenceFeatureExtractor):
             ).T
 
             fbank = torch.from_numpy(fbank)
-        
-        if self.apply_spec_augment:
-            freq_mask = transforms.FrequencyMasking(freq_mask_param=self.freq_mask_param)
-            time_mask = transforms.TimeMasking(time_mask_param=self.time_mask_param)
-
-            fbank = fbank.unsqueeze(0)  # Add a batch dimension
-            fbank = freq_mask(fbank)
-            fbank = time_mask(fbank)
-            fbank = fbank.squeeze(0)  # Remove batch dimension
 
         n_frames = fbank.shape[0]
         difference = max_length - n_frames
