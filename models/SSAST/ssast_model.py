@@ -1,5 +1,6 @@
 import math
 import numpy as np
+import random
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -7,12 +8,12 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from ...activations import ACT2FN
-from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, SequenceClassifierOutput
-from ...modeling_utils import PreTrainedModel
-from ...pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
-from ...utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward, logging
-from .configuration_audio_spectrogram_transformer import ASTConfig
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, SequenceClassifierOutput
+from transformers.modeling_utils import PreTrainedModel
+from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
+from transformers.utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward, logging
+from .ssast_config import SSASTConfig
 
 
 logger = logging.get_logger(__name__)
@@ -31,11 +32,35 @@ _SEQ_CLASS_EXPECTED_LOSS = 0.17
 
 
 AUDIO_SPECTROGRAM_TRANSFORMER_PRETRAINED_MODEL_ARCHIVE_LIST = [
-    "Simon-Kotchou/ssast-base-frame-audioset-128-1",
+    "Simon-Kotchou/ssast-base-frame-audioset-128-2",
     # See all Audio Spectrogram Transformer models at https://huggingface.co/models?filter=ast
 ]
 
 
+class SSASTPatchEmbeddings(nn.Module):
+    """
+    This class turns `input_values` into the initial `hidden_states` (patch embeddings) of shape `(batch_size,
+    seq_length, hidden_size)` to be consumed by a Transformer.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+
+        patch_freq_size = config.patch_freq_size
+        patch_time_size = config.patch_time_size
+        frequency_stride = config.frequency_stride
+        time_stride = config.time_stride
+
+        self.projection = nn.Conv2d(
+            1, config.hidden_size, kernel_size=(patch_freq_size, patch_time_size), stride=(frequency_stride, time_stride)
+        )
+
+    def forward(self, input_values: torch.Tensor) -> torch.Tensor:
+        input_values = input_values.unsqueeze(1)
+        input_values = input_values.transpose(2, 3)
+        embeddings = self.projection(input_values).flatten(2).transpose(1, 2)
+        return embeddings
+    
 class SSASTEmbeddings(nn.Module):
     """
     Construct the CLS token, position and patch embeddings.
@@ -48,18 +73,22 @@ class SSASTEmbeddings(nn.Module):
         self.distillation_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
         self.patch_embeddings = SSASTPatchEmbeddings(config)
 
-        frequency_out_dimension, time_out_dimension = self.get_shape(config)
-        num_patches = frequency_out_dimension * time_out_dimension
+        num_patches = self.get_shape(config)[0] * self.get_shape(config)[1]
         self.position_embeddings = nn.Parameter(torch.zeros(1, num_patches + 2, config.hidden_size))
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.config = config
 
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        self.mask_token = nn.init.xavier_normal_(self.mask_token)
+
+        self.cpredlayer = nn.Sequential(nn.Linear(config.hidden_size, config.hidden_size), nn.ReLU(), nn.Linear(config.hidden_size, config.patch_freq_size * config.patch_time_size))
+        self.gpredlayer = nn.Sequential(nn.Linear(config.hidden_size, config.hidden_size), nn.ReLU(), nn.Linear(config.hidden_size, config.patch_freq_size * config.patch_time_size))
+
     def get_shape(self, config):
         # see Karpathy's cs231n blog on how to calculate the output dimensions
         # https://cs231n.github.io/convolutional-networks/#conv
-        patch_size = config.patch_freq_size * config.patch_time_size
-        frequency_out_dimension = (config.num_mel_bins - patch_size) // config.frequency_stride + 1
-        time_out_dimension = (config.max_length - patch_size) // config.time_stride + 1
+        frequency_out_dimension = (config.num_mel_bins - config.patch_freq_size) // config.frequency_stride + 1
+        time_out_dimension = (config.max_length - config.patch_time_size) // config.time_stride + 1
 
         return frequency_out_dimension, time_out_dimension
 
@@ -75,36 +104,30 @@ class SSASTEmbeddings(nn.Module):
 
         return embeddings
 
+    def gen_maskid_patch(self, sequence_len, mask_size, cluster=3):
+        mask_id = []
+        cur_clus = random.randrange(cluster) + 3
 
-class SSASTPatchEmbeddings(nn.Module):
-    """
-    This class turns `input_values` into the initial `hidden_states` (patch embeddings) of shape `(batch_size,
-    seq_length, hidden_size)` to be consumed by a Transformer.
-    """
+        while len(list(set(mask_id))) <= mask_size:
+            start_id = random.randrange(sequence_len)
+            cur_mask = []
+            for i in range(0, cur_clus):
+                for j in range(0, cur_clus):
+                    mask_cand = start_id + self.get_shape(self.config)[1] * i + j
+                    if mask_cand > 0 and mask_cand < sequence_len:
+                        cur_mask.append(mask_cand)
+            mask_id = mask_id + cur_mask
+        mask_id = list(set(mask_id))[:mask_size]
+        return torch.tensor(mask_id)
 
-    def __init__(self, config):
-        super().__init__()
-
-        patch_freq_size = config.patch_freq_size
-        patch_time_size = config.patch_time_size
-        patch_size = config.patch_freq_size * config.patch_time_size
-        frequency_stride = config.frequency_stride
-        time_stride = config.time_stride
-
-        self.projection = nn.Conv2d(
-            1, config.hidden_size, kernel_size=(patch_freq_size, patch_time_size), stride=(frequency_stride, time_stride)
-        )
-
-    def forward(self, input_values: torch.Tensor) -> torch.Tensor:
-        input_values = input_values.unsqueeze(1)
-        input_values = input_values.transpose(2, 3)
-        embeddings = self.projection(input_values).flatten(2).transpose(1, 2)
-        return embeddings
+    def gen_maskid_frame(self, sequence_len, mask_size):
+        mask_id = random.sample(range(0, sequence_len), mask_size)
+        return torch.tensor(mask_id)
 
 
 # Copied from transformers.models.vit.modeling_vit.ViTSelfAttention with ViT->AST
-class ASTSelfAttention(nn.Module):
-    def __init__(self, config: ASTConfig) -> None:
+class SSASTSelfAttention(nn.Module):
+    def __init__(self, config: SSASTConfig) -> None:
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
@@ -164,13 +187,13 @@ class ASTSelfAttention(nn.Module):
 
 
 # Copied from transformers.models.vit.modeling_vit.ViTSelfOutput with ViT->AST
-class ASTSelfOutput(nn.Module):
+class SSASTSelfOutput(nn.Module):
     """
     The residual connection is defined in ASTLayer instead of here (as is the case with other models), due to the
     layernorm applied before each block.
     """
 
-    def __init__(self, config: ASTConfig) -> None:
+    def __init__(self, config: SSASTConfig) -> None:
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -183,11 +206,11 @@ class ASTSelfOutput(nn.Module):
 
 
 # Copied from transformers.models.vit.modeling_vit.ViTAttention with ViT->AST
-class ASTAttention(nn.Module):
-    def __init__(self, config: ASTConfig) -> None:
+class SSASTAttention(nn.Module):
+    def __init__(self, config: SSASTConfig) -> None:
         super().__init__()
-        self.attention = ASTSelfAttention(config)
-        self.output = ASTSelfOutput(config)
+        self.attention = SSASTSelfAttention(config)
+        self.output = SSASTSelfOutput(config)
         self.pruned_heads = set()
 
     def prune_heads(self, heads: Set[int]) -> None:
@@ -223,8 +246,8 @@ class ASTAttention(nn.Module):
 
 
 # Copied from transformers.models.vit.modeling_vit.ViTIntermediate with ViT->AST
-class ASTIntermediate(nn.Module):
-    def __init__(self, config: ASTConfig) -> None:
+class SSASTIntermediate(nn.Module):
+    def __init__(self, config: SSASTConfig) -> None:
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
@@ -240,8 +263,8 @@ class ASTIntermediate(nn.Module):
 
 
 # Copied from transformers.models.vit.modeling_vit.ViTOutput with ViT->AST
-class ASTOutput(nn.Module):
-    def __init__(self, config: ASTConfig) -> None:
+class SSASTOutput(nn.Module):
+    def __init__(self, config: SSASTConfig) -> None:
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -256,16 +279,16 @@ class ASTOutput(nn.Module):
 
 
 # Copied from transformers.models.vit.modeling_vit.ViTLayer with ViT->AST
-class ASTLayer(nn.Module):
+class SSASTLayer(nn.Module):
     """This corresponds to the Block class in the timm implementation."""
 
-    def __init__(self, config: ASTConfig) -> None:
+    def __init__(self, config: SSASTConfig) -> None:
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        self.attention = ASTAttention(config)
-        self.intermediate = ASTIntermediate(config)
-        self.output = ASTOutput(config)
+        self.attention = SSASTAttention(config)
+        self.intermediate = SSASTIntermediate(config)
+        self.output = SSASTOutput(config)
         self.layernorm_before = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.layernorm_after = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
@@ -299,11 +322,11 @@ class ASTLayer(nn.Module):
 
 
 # Copied from transformers.models.vit.modeling_vit.ViTEncoder with ViT->AST
-class ASTEncoder(nn.Module):
-    def __init__(self, config: ASTConfig) -> None:
+class SSASTEncoder(nn.Module):
+    def __init__(self, config: SSASTConfig) -> None:
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([ASTLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([SSASTLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
     def forward(
@@ -348,24 +371,27 @@ class ASTEncoder(nn.Module):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
+    
+class SSASTMLPHead(nn.Module):
+    def __init__(self, config: SSASTConfig):
+        super().__init__()
+        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dense = nn.Linear(config.hidden_size, config.num_labels) if config.num_labels > 0 else nn.Identity()
 
-class ASTPreTrainedModel(PreTrainedModel):
-    """
-    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
-    models.
-    """
+    def forward(self, hidden_state):
+        hidden_state = self.layernorm(hidden_state)
+        hidden_state = self.dense(hidden_state)
+        return hidden_state
+    
 
-    config_class = ASTConfig
-    base_model_prefix = "audio_spectrogram_transformer"
+class SSASTPreTrainedModel(PreTrainedModel):
+    config_class = SSASTConfig
+    base_model_prefix = "ssast"
     main_input_name = "input_values"
     supports_gradient_checkpointing = True
 
-    # Copied from transformers.models.deit.modeling_deit.DeiTPreTrainedModel._init_weights
     def _init_weights(self, module: Union[nn.Linear, nn.Conv2d, nn.LayerNorm]) -> None:
-        """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            # Upcast the input in `fp32` and cast it back to desired `dtype` to avoid
-            # `trunc_normal_cpu` not implemented in `half` issues
             module.weight.data = nn.init.trunc_normal_(
                 module.weight.data.to(torch.float32), mean=0.0, std=self.config.initializer_range
             ).to(module.weight.dtype)
@@ -376,22 +402,50 @@ class ASTPreTrainedModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
 
 
-class SSASTBaseModel(ASTPreTrainedModel):
-    def __init__(self, config: ASTConfig) -> None:
+class SSASTModel(SSASTPreTrainedModel):
+    def __init__(self, config: SSASTConfig) -> None:
         super().__init__(config)
         self.config = config
 
         self.embeddings = SSASTEmbeddings(config)
-        self.encoder = ASTEncoder(config)
+        self.encoder = SSASTEncoder(config)
 
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        # Calculate num_patches
+        frequency_out_dimension, time_out_dimension = self.get_shape(config)
+        num_patches = frequency_out_dimension * time_out_dimension
+        self.num_patches = num_patches
 
         # Initialize weights and apply final processing
         self.post_init()
 
-    def forward(self, input_values, head_mask=None, output_attentions=None, output_hidden_states=None, return_dict=None):
+    def get_shape(self, config):
+        # see Karpathy's cs231n blog on how to calculate the output dimensions
+        # https://cs231n.github.io/convolutional-networks/#conv
+        frequency_out_dimension = (config.num_mel_bins - config.patch_freq_size) // config.frequency_stride + 1
+        time_out_dimension = (config.max_length - config.patch_time_size) // config.time_stride + 1
+
+        return frequency_out_dimension, time_out_dimension
+
+    def get_input_embeddings(self) -> SSASTPatchEmbeddings:
+        return self.embeddings.patch_embeddings
+
+    def forward(
+        self,
+        input_values: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        task: Optional[str] = None,
+        mask_patch: Optional[int] = 400,
+        cluster: Optional[bool] = True,
+    ) -> Union[Tuple, BaseModelOutputWithPooling]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_values is None:
@@ -409,11 +463,20 @@ class SSASTBaseModel(ASTPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-
         sequence_output = encoder_outputs[0]
         sequence_output = self.layernorm(sequence_output)
 
         pooled_output = (sequence_output[:, 0] + sequence_output[:, 1]) / 2
+
+        if task == 'pretrain_mpc':
+            return self.mpc(sequence_output, input_values, mask_patch, cluster)
+        elif task == 'pretrain_mpg':
+            return self.mpg(sequence_output, input_values, mask_patch, cluster)
+        elif task == 'pretrain_joint':
+            acc, loss1 = self.mpc(sequence_output, input_values, mask_patch, cluster)
+            loss2 = self.mpg(sequence_output, input_values, mask_patch, cluster)
+            loss = loss1 + 10 * loss2
+            return acc, loss
 
         if not return_dict:
             return (sequence_output, pooled_output) + encoder_outputs[1:]
@@ -425,158 +488,131 @@ class SSASTBaseModel(ASTPreTrainedModel):
             attentions=encoder_outputs.attentions,
         )
 
-class SSASTForPretraining(ASTPreTrainedModel):
-    def __init__(self, config: ASTConfig) -> None:
-        super().__init__(config)
-        self.config = config
-
-        self.ast = SSASTBaseModel(config)
-
-        self.cls_token_num = 2
-        self.original_embedding_dim = config.hidden_size
-        self.num_patches = self.ast.embeddings.patch_embeddings.num_patches
-
-        self.mask_embed = nn.Parameter(torch.zeros([1, 1, self.original_embedding_dim]))
-        self.mask_embed = torch.nn.init.xavier_normal_(self.mask_embed)
-
-        self.cpredlayer = nn.Sequential(
-            nn.Linear(self.original_embedding_dim, self.original_embedding_dim), 
-            nn.ReLU(), 
-            nn.Linear(self.original_embedding_dim, 256)
-        )
-        self.gpredlayer = nn.Sequential(
-            nn.Linear(self.original_embedding_dim, self.original_embedding_dim), 
-            nn.ReLU(), 
-            nn.Linear(self.original_embedding_dim, 256)
-        )
-        self.unfold = torch.nn.Unfold(
-            kernel_size=(config.patch_freq_size, config.patch_time_size), 
-            stride=(config.frequency_stride, config.time_stride)
-        )
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def forward(self, input_values, task, cluster=True, mask_patch=400):
-        input_values = input_values.unsqueeze(1).transpose(2, 3)
-
-        if task == 'pretrain_mpc':
-            return self.mpc(input_values, mask_patch=mask_patch, cluster=cluster)
-        elif task == 'pretrain_mpg':
-            return self.mpg(input_values, mask_patch=mask_patch, cluster=cluster)
-        else:
-            raise Exception('Task unrecognized.')
-
-    def mpc(self, input_values, mask_patch, cluster):
-        input = self.unfold(input_values).transpose(1, 2)
+    def mpc(self, hidden_states, input_values, mask_patch, cluster):
         B = input_values.shape[0]
-        x = self.ast.embeddings.patch_embeddings(input_values)
+        input_values = self.embeddings.patch_embeddings(input_values)
 
-        encode_samples = torch.empty((B, mask_patch, 256), device=x.device, requires_grad=False).float()
-        mask_index = torch.empty((B, mask_patch), device=x.device, requires_grad=False).long()
-        mask_dense = torch.ones([x.shape[0], x.shape[1], x.shape[2]], device=x.device)
+        encode_samples = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=input_values.device, requires_grad=False).float()
+        mask_index = torch.empty((B, mask_patch), device=input_values.device, requires_grad=False).long()
+        mask_dense = torch.ones([B, hidden_states.shape[1], hidden_states.shape[2]], device=input_values.device)
 
         for i in range(B):
             if cluster:
-                mask_index[i] = self.gen_maskid_patch(self.num_patches, mask_patch)
+                mask_index[i] = self.embeddings.gen_maskid_patch(self.num_patches, mask_patch)
             else:
-                mask_index[i] = self.gen_maskid_frame(self.num_patches, mask_patch)
-            encode_samples[i] = input[i, mask_index[i], :].clone().detach()
+                mask_index[i] = self.embeddings.gen_maskid_frame(self.num_patches, mask_patch)
+            encode_samples[i] = input_values[i, mask_index[i], :].clone().detach()
             mask_dense[i, mask_index[i], :] = 0
 
-        mask_tokens = self.mask_embed.expand(B, x.shape[1], -1)
-        x = x * mask_dense + (1 - mask_dense) * mask_tokens
+        mask_tokens = self.embeddings.mask_token.expand(B, hidden_states.shape[1], -1)
+        hidden_states = hidden_states * mask_dense + (1 - mask_dense) * mask_tokens
 
-        cls_tokens = self.ast.embeddings.cls_token.expand(B, -1, -1)
-        dist_token = self.ast.embeddings.distillation_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, dist_token, x), dim=1)
-        x = x + self.ast.embeddings.position_embeddings
-        x = self.ast.embeddings.dropout(x)
-
-        for blk in self.ast.encoder.layer:
-            x = blk(x)
-        x = self.ast.layernorm(x)
-
-        pred = torch.empty((B, mask_patch, 256), device=x.device).float()
+        pred = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=input_values.device).float()
         for i in range(B):
-            pred[i] = self.cpredlayer(x[i, mask_index[i] + self.cls_token_num, :])
+            pred[i] = self.embeddings.cpredlayer(hidden_states[i, mask_index[i], :])
 
-        nce = torch.tensor(0.0).to(x.device)
-        correct = torch.tensor(0.0).to(x.device)
+        nce = torch.tensor(0.0).to(input_values.device)
+        correct = torch.tensor(0.0).to(input_values.device)
         for i in range(B):
             total = torch.mm(encode_samples[i], torch.transpose(pred[i], 0, 1))
-            correct += torch.sum(torch.eq(torch.argmax(total, dim=0), torch.arange(0, mask_patch, device=x.device)))
+            correct += torch.sum(torch.eq(torch.argmax(torch.softmax(total, dim=-1), dim=0), torch.arange(0, mask_patch, device=input_values.device)))
             nce += torch.sum(torch.diag(torch.log_softmax(total, dim=-1)))
+
         acc = 1.0 * correct / (B * mask_patch)
         nce = nce / (-1.0 * B * mask_patch)
 
         return acc, nce
 
-    def mpg(self, input_values, mask_patch, cluster):
+    def mpg(self, hidden_states, input_values, mask_patch, cluster):
         B = input_values.shape[0]
-        x = self.ast.embeddings.patch_embeddings(input_values)
-        input = self.unfold(input_values).transpose(1, 2)
+        input_values = self.embeddings.patch_embeddings(input_values)
 
-        mask_index = torch.empty((B, mask_patch), device=x.device, requires_grad=False).long()
-        mask_dense = torch.ones([x.shape[0], x.shape[1], x.shape[2]], device=x.device)
+        mask_index = torch.empty((B, mask_patch), device=input_values.device, requires_grad=False).long()
+        mask_dense = torch.ones([B, hidden_states.shape[1], hidden_states.shape[2]], device=input_values.device)
 
         for i in range(B):
             if cluster:
-                mask_index[i] = self.gen_maskid_patch(self.num_patches, mask_patch)
+                mask_index[i] = self.embeddings.gen_maskid_patch(hidden_states.shape[1] - 2, mask_patch)
             else:
-                mask_index[i] = self.gen_maskid_frame(self.num_patches, mask_patch)
-            mask_dense[i, mask_index[i], :] = 0
+                mask_index[i] = self.embeddings.gen_maskid_frame(hidden_states.shape[1] - 2, mask_patch)
+            mask_dense[i, mask_index[i] + 2, :] = 0
 
-        mask_tokens = self.mask_embed.expand(B, x.shape[1], -1)
-        x = x * mask_dense + (1 - mask_dense) * mask_tokens
+        mask_tokens = self.embeddings.mask_token.expand(B, hidden_states.shape[1], -1)
+        hidden_states = hidden_states * mask_dense + (1 - mask_dense) * mask_tokens
 
-        cls_tokens = self.ast.embeddings.cls_token.expand(B, -1, -1)
-        dist_token = self.ast.embeddings.distillation_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, dist_token, x), dim=1)
-        x = x + self.ast.embeddings.position_embeddings
-        x = self.ast.embeddings.dropout(x)
-
-        for blk in self.ast.encoder.layer:
-            x = blk(x)
-        x = self.ast.layernorm(x)
-
-        pred = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=x.device).float()
-        target = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=x.device).float()
+        pred = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=input_values.device).float()
+        target = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=input_values.device).float()
 
         for i in range(B):
-            pred[i] = self.gpredlayer(x[i, mask_index[i] + self.cls_token_num, :])
-            target[i] = input[i, mask_index[i], :]
+            pred[i] = self.embeddings.gpredlayer(hidden_states[i, mask_index[i] + 2, :])
+            target[i] = input_values[i, mask_index[i], :]
 
         mse = torch.mean((pred - target) ** 2)
 
         return mse
 
-    def gen_maskid_patch(self, sequence_len=512, mask_size=100, cluster=3):
-        mask_id = []
-        cur_clus = np.random.randint(low=3, high=cluster+3)
-
-        while len(set(mask_id)) <= mask_size:
-            start_id = np.random.randint(sequence_len)
-            cur_mask = []
-            for i in range(cur_clus):
-                for j in range(cur_clus):
-                    mask_cand = start_id + self.config.frequency_stride * i + j
-                    if mask_cand > 0 and mask_cand < sequence_len:
-                        cur_mask.append(mask_cand)
-            mask_id = mask_id + cur_mask
-        mask_id = list(set(mask_id))[:mask_size]
-        return torch.tensor(mask_id)
-
-    def gen_maskid_frame(self, sequence_len=512, mask_size=100):
-        mask_id = np.random.choice(range(sequence_len), mask_size, replace=False)
-        return torch.tensor(mask_id)
-    
-class SSASTForAudioClassification(ASTPreTrainedModel):
-    def __init__(self, config: ASTConfig) -> None:
+class SSASTForPreTraining(SSASTPreTrainedModel):
+    def __init__(self, config: SSASTConfig) -> None:
         super().__init__(config)
+        self.ssast = SSASTModel(config)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_values: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        task: Optional[str] = None,
+        mask_patch: Optional[int] = 400,
+        cluster: Optional[bool] = True,
+    ) -> Union[tuple, BaseModelOutputWithPooling]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.ssast(
+            input_values,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            task=task,
+            mask_patch=mask_patch,
+            cluster=cluster,
+        )
+
+        if task == 'pretrain_mpc':
+            acc, nce_loss = outputs
+            loss = nce_loss
+        elif task == 'pretrain_mpg':
+            mse_loss = outputs
+            loss = mse_loss
+        elif task == 'pretrain_joint':
+            acc, loss = outputs
+        else:
+            raise ValueError("Unsupported pretraining task. Choose either 'pretrain_mpc', 'pretrain_mpg' or 'pretrain_joint'.")
+
+        if not return_dict:
+            output = (loss,) + outputs[2:]
+            return output
+
+        return BaseModelOutputWithPooling(
+            loss=loss,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+class SSASTForAudioClassification(SSASTPreTrainedModel):
+    def __init__(self, config: SSASTConfig) -> None:
+        super().__init__(config)
+
         self.num_labels = config.num_labels
-        self.ast = SSASTBaseModel(config)
-        self.classifier = ASTMLPHead(config)
+        self.ssast = SSASTModel(config)
+
+        # Classifier head
+        self.classifier = SSASTMLPHead(config)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -592,7 +628,7 @@ class SSASTForAudioClassification(ASTPreTrainedModel):
     ) -> Union[tuple, SequenceClassifierOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.ast(
+        outputs = self.ssast(
             input_values,
             head_mask=head_mask,
             output_attentions=output_attentions,
