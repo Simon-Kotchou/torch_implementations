@@ -7,6 +7,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import matplotlib.pyplot as plt
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, SequenceClassifierOutput
@@ -106,7 +107,7 @@ class SSASTEmbeddings(nn.Module):
 
     def gen_maskid_patch(self, sequence_len, mask_size, cluster=3):
         mask_id = []
-        cur_clus = random.randrange(cluster) + 3
+        cur_clus = random.randrange(cluster) + 3 #important const
 
         while len(list(set(mask_id))) <= mask_size:
             start_id = random.randrange(sequence_len)
@@ -383,7 +384,6 @@ class SSASTMLPHead(nn.Module):
         hidden_state = self.dense(hidden_state)
         return hidden_state
     
-
 class SSASTPreTrainedModel(PreTrainedModel):
     config_class = SSASTConfig
     base_model_prefix = "ssast"
@@ -400,7 +400,6 @@ class SSASTPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
-
 
 class SSASTModel(SSASTPreTrainedModel):
     def __init__(self, config: SSASTConfig) -> None:
@@ -421,11 +420,8 @@ class SSASTModel(SSASTPreTrainedModel):
         self.post_init()
 
     def get_shape(self, config):
-        # see Karpathy's cs231n blog on how to calculate the output dimensions
-        # https://cs231n.github.io/convolutional-networks/#conv
         frequency_out_dimension = (config.num_mel_bins - config.patch_freq_size) // config.frequency_stride + 1
         time_out_dimension = (config.max_length - config.patch_time_size) // config.time_stride + 1
-
         return frequency_out_dimension, time_out_dimension
 
     def get_input_embeddings(self) -> SSASTPatchEmbeddings:
@@ -454,6 +450,16 @@ class SSASTModel(SSASTPreTrainedModel):
         # Prepare head mask if needed
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
+        if task == 'pretrain_mpc':
+            return self.mpc(input_values, mask_patch, cluster)
+        elif task == 'pretrain_mpg':
+            return self.mpg(input_values, mask_patch, cluster)
+        elif task == 'pretrain_joint':
+            acc, loss1 = self.mpc(input_values, mask_patch, cluster)
+            loss2 = self.mpg(input_values, mask_patch, cluster)
+            loss = loss1 + 10 * loss2
+            return acc, loss
+
         embedding_output = self.embeddings(input_values)
 
         encoder_outputs = self.encoder(
@@ -468,16 +474,6 @@ class SSASTModel(SSASTPreTrainedModel):
 
         pooled_output = (sequence_output[:, 0] + sequence_output[:, 1]) / 2
 
-        if task == 'pretrain_mpc':
-            return self.mpc(sequence_output, input_values, mask_patch, cluster)
-        elif task == 'pretrain_mpg':
-            return self.mpg(sequence_output, input_values, mask_patch, cluster)
-        elif task == 'pretrain_joint':
-            acc, loss1 = self.mpc(sequence_output, input_values, mask_patch, cluster)
-            loss2 = self.mpg(sequence_output, input_values, mask_patch, cluster)
-            loss = loss1 + 10 * loss2
-            return acc, loss
-
         if not return_dict:
             return (sequence_output, pooled_output) + encoder_outputs[1:]
 
@@ -488,34 +484,46 @@ class SSASTModel(SSASTPreTrainedModel):
             attentions=encoder_outputs.attentions,
         )
 
-    def mpc(self, hidden_states, input_values, mask_patch, cluster):
-        B = input_values.shape[0]
-        input_values = self.embeddings.patch_embeddings(input_values)
+    def mpc(self, raw_input, mask_patch, cluster):
+        B = raw_input.shape[0]
 
-        encode_samples = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=input_values.device, requires_grad=False).float()
-        mask_index = torch.empty((B, mask_patch), device=input_values.device, requires_grad=False).long()
-        mask_dense = torch.ones([B, hidden_states.shape[1], hidden_states.shape[2]], device=input_values.device)
+        input_patches = self.embeddings.patch_embeddings(raw_input)
+        num_patches = input_patches.shape[1]
+
+        # Unfold the input for encode_samples
+        unfolded_input = nn.functional.unfold(
+            raw_input.unsqueeze(1), 
+            kernel_size=(self.config.patch_freq_size, self.config.patch_time_size), 
+            stride=(self.config.frequency_stride, self.config.time_stride)
+        ).transpose(1, 2)  # [B, num_patches, patch_dim]
+
+        encode_samples = torch.empty((B, mask_patch, unfolded_input.shape[-1]), device=raw_input.device, requires_grad=False).float()  # dim 256
+        mask_index = torch.empty((B, mask_patch), device=raw_input.device, requires_grad=False).long()
+        mask_dense = torch.ones([B, num_patches, input_patches.shape[-1]], device=raw_input.device)
 
         for i in range(B):
             if cluster:
-                mask_index[i] = self.embeddings.gen_maskid_patch(self.num_patches, mask_patch)
+                mask_index[i] = self.embeddings.gen_maskid_patch(num_patches, mask_patch)
             else:
-                mask_index[i] = self.embeddings.gen_maskid_frame(self.num_patches, mask_patch)
-            encode_samples[i] = input_values[i, mask_index[i], :].clone().detach()
+                mask_index[i] = self.embeddings.gen_maskid_frame(num_patches, mask_patch)
+            encode_samples[i] = unfolded_input[i, mask_index[i], :].clone().detach()
             mask_dense[i, mask_index[i], :] = 0
 
-        mask_tokens = self.embeddings.mask_token.expand(B, hidden_states.shape[1], -1)
-        hidden_states = hidden_states * mask_dense + (1 - mask_dense) * mask_tokens
+        mask_tokens = self.embeddings.mask_token.expand(B, num_patches, -1)
+        masked_patches = input_patches * mask_dense + (1 - mask_dense) * mask_tokens
 
-        pred = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=input_values.device).float()
+        masked_embedding_output = self.embeddings.patch_embeddings(masked_patches)
+        hidden_states = self.encoder(masked_embedding_output)[0]
+
+        pred = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=raw_input.device).float()
         for i in range(B):
-            pred[i] = self.embeddings.cpredlayer(hidden_states[i, mask_index[i], :])
+            pred[i] = self.embeddings.cpredlayer(hidden_states[i, mask_index[i] + 2, :])  # project to 256 dimensions
 
-        nce = torch.tensor(0.0).to(input_values.device)
-        correct = torch.tensor(0.0).to(input_values.device)
+        nce = torch.tensor(0.0).to(raw_input.device)
+        correct = torch.tensor(0.0).to(raw_input.device)
         for i in range(B):
             total = torch.mm(encode_samples[i], torch.transpose(pred[i], 0, 1))
-            correct += torch.sum(torch.eq(torch.argmax(torch.softmax(total, dim=-1), dim=0), torch.arange(0, mask_patch, device=input_values.device)))
+            correct += torch.sum(torch.eq(torch.argmax(torch.softmax(total, dim=-1), dim=0), torch.arange(0, mask_patch, device=raw_input.device)))
             nce += torch.sum(torch.diag(torch.log_softmax(total, dim=-1)))
 
         acc = 1.0 * correct / (B * mask_patch)
@@ -523,34 +531,46 @@ class SSASTModel(SSASTPreTrainedModel):
 
         return acc, nce
 
-    def mpg(self, hidden_states, input_values, mask_patch, cluster):
-        B = input_values.shape[0]
-        input_values = self.embeddings.patch_embeddings(input_values)
+    def mpg(self, raw_input, mask_patch, cluster):
+        B = raw_input.shape[0]
 
-        mask_index = torch.empty((B, mask_patch), device=input_values.device, requires_grad=False).long()
-        mask_dense = torch.ones([B, hidden_states.shape[1], hidden_states.shape[2]], device=input_values.device)
+        input_patches = self.embeddings.patch_embeddings(raw_input)
+        num_patches = input_patches.shape[1]
+
+        # Unfold the input for target
+        unfolded_input = nn.functional.unfold(
+            raw_input.unsqueeze(1),
+            kernel_size=(self.config.patch_freq_size, self.config.patch_time_size), 
+            stride=(self.config.frequency_stride, self.config.time_stride)
+        ).transpose(1, 2)  # [B, num_patches, patch_dim]
+
+        mask_index = torch.empty((B, mask_patch), device=raw_input.device, requires_grad=False).long()
+        mask_dense = torch.ones([B, num_patches, input_patches.shape[-1]], device=raw_input.device)
 
         for i in range(B):
             if cluster:
-                mask_index[i] = self.embeddings.gen_maskid_patch(hidden_states.shape[1] - 2, mask_patch)
+                mask_index[i] = self.embeddings.gen_maskid_patch(num_patches, mask_patch)
             else:
-                mask_index[i] = self.embeddings.gen_maskid_frame(hidden_states.shape[1] - 2, mask_patch)
-            mask_dense[i, mask_index[i] + 2, :] = 0
+                mask_index[i] = self.embeddings.gen_maskid_frame(num_patches, mask_patch)
+            mask_dense[i, mask_index[i], :] = 0
 
-        mask_tokens = self.embeddings.mask_token.expand(B, hidden_states.shape[1], -1)
-        hidden_states = hidden_states * mask_dense + (1 - mask_dense) * mask_tokens
+        mask_tokens = self.embeddings.mask_token.expand(B, num_patches, -1)
+        masked_patches = input_patches * mask_dense + (1 - mask_dense) * mask_tokens
 
-        pred = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=input_values.device).float()
-        target = torch.empty((B, mask_patch, self.config.patch_freq_size * self.config.patch_time_size), device=input_values.device).float()
+        masked_embedding_output = self.embeddings.patch_embeddings(masked_patches)
+        hidden_states = self.encoder(masked_embedding_output)[0]
+
+        pred = torch.empty((B, mask_patch, unfolded_input.shape[-1]), device=raw_input.device).float()
+        target = torch.empty((B, mask_patch, unfolded_input.shape[-1]), device=raw_input.device).float()
 
         for i in range(B):
-            pred[i] = self.embeddings.gpredlayer(hidden_states[i, mask_index[i] + 2, :])
-            target[i] = input_values[i, mask_index[i], :]
+            pred[i] = self.embeddings.gpredlayer(hidden_states[i, mask_index[i] + 2, :])  # project to 256 dimensions
+            target[i] = unfolded_input[i, mask_index[i], :]
 
         mse = torch.mean((pred - target) ** 2)
 
         return mse
-
+    
 class SSASTForPreTraining(SSASTPreTrainedModel):
     def __init__(self, config: SSASTConfig) -> None:
         super().__init__(config)
@@ -583,26 +603,34 @@ class SSASTForPreTraining(SSASTPreTrainedModel):
             cluster=cluster,
         )
 
-        if task == 'pretrain_mpc':
-            acc, nce_loss = outputs
-            loss = nce_loss
-        elif task == 'pretrain_mpg':
-            mse_loss = outputs
-            loss = mse_loss
-        elif task == 'pretrain_joint':
-            acc, loss = outputs
+        if task in ['pretrain_mpc', 'pretrain_mpg', 'pretrain_joint']:
+            if task == 'pretrain_mpc':
+                acc, nce_loss = outputs
+                loss = nce_loss
+            elif task == 'pretrain_mpg':
+                mse_loss = outputs
+                loss = mse_loss
+            elif task == 'pretrain_joint':
+                acc, loss = outputs
+            else:
+                raise ValueError("Unsupported pretraining task. Choose either 'pretrain_mpc', 'pretrain_mpg' or 'pretrain_joint'.")
+
+            if not return_dict:
+                return (loss,)
+
+            return (loss,)
+
         else:
-            raise ValueError("Unsupported pretraining task. Choose either 'pretrain_mpc', 'pretrain_mpg' or 'pretrain_joint'.")
+            if not return_dict:
+                return outputs
 
-        if not return_dict:
-            output = (loss,) + outputs[2:]
-            return output
+            return BaseModelOutputWithPooling(
+                last_hidden_state=outputs[0],
+                pooler_output=outputs[1],
+                hidden_states=outputs[2] if len(outputs) > 2 else None,
+                attentions=outputs[3] if len(outputs) > 3 else None,
+            )
 
-        return BaseModelOutputWithPooling(
-            loss=loss,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
 
 class SSASTForAudioClassification(SSASTPreTrainedModel):
     def __init__(self, config: SSASTConfig) -> None:
