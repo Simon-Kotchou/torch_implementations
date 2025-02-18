@@ -216,3 +216,212 @@ class HunyuanVideoDiffusionModel(nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
+    
+        def forward(
+        self, 
+        x, 
+        timesteps, 
+        text_embeddings, 
+        clip_text_embeddings=None, 
+        depth_maps=None,
+        frame_indices=None
+    ):
+        """
+        Forward pass of HunyuanVideo model.
+        
+        Args:
+            x: Input latent video [B, C, T, H, W]
+            timesteps: Diffusion timesteps [B]
+            text_embeddings: Text embeddings from LLM [B, L, D]
+            clip_text_embeddings: Optional global CLIP text features [B, D_clip]
+            depth_maps: Optional depth maps [B, T, 1, H, W]
+            frame_indices: Optional frame position indices [B, T]
+            
+        Returns:
+            Predicted velocity field
+        """
+        batch_size, channels, time_steps, height, width = x.shape
+        
+        # Time embedding
+        t_emb = self.time_embed(timesteps)  # [B, D_t]
+        
+        # Patchify input video
+        x_seq = self.patchify(x)  # [B, T*H*W, C]
+        
+        # Get position indices for 3D RoPE
+        t_idx, h_idx, w_idx = self.get_position_indices(
+            batch_size, time_steps, height, width
+        )
+        
+        # Process global text features if provided
+        global_context = None
+        if clip_text_embeddings is not None:
+            global_context = self.global_text_proj(clip_text_embeddings)  # [B, D_c]
+        
+        # ===== DUAL STREAM PROCESSING =====
+        video_features = x_seq
+        text_features = text_embeddings
+        
+        for i in range(self.num_dual_stream_blocks):
+            # Process video stream
+            video_features = self.video_dual_blocks[i](
+                video_features,
+                t_emb,
+                t_idx, h_idx, w_idx,
+                depth_maps=depth_maps if self.use_depth_aware_conv else None,
+                global_context=global_context
+            )
+            
+            # Process text stream
+            text_features = self.text_dual_blocks[i](text_features)
+        
+        # ===== SINGLE STREAM PROCESSING =====
+        # Concatenate video and text features
+        concat_features = torch.cat([video_features, text_features], dim=1)
+        
+        # Update position indices for concatenated sequence
+        text_seq_len = text_features.shape[1]
+        t_idx_extended = torch.cat([
+            t_idx,
+            torch.zeros(batch_size, text_seq_len, device=self.device)
+        ], dim=1)
+        h_idx_extended = torch.cat([
+            h_idx,
+            torch.zeros(batch_size, text_seq_len, device=self.device)
+        ], dim=1)
+        w_idx_extended = torch.cat([
+            w_idx,
+            torch.zeros(batch_size, text_seq_len, device=self.device)
+        ], dim=1)
+        
+        # Process through single stream blocks
+        for i in range(self.num_single_stream_blocks):
+            concat_features = self.single_stream_blocks[i](
+                concat_features,
+                t_emb,
+                t_idx_extended, h_idx_extended, w_idx_extended,
+                depth_maps=depth_maps if self.use_depth_aware_conv else None,
+                global_context=global_context
+            )
+        
+        # Extract video features from concatenated sequence
+        video_seq_len = time_steps * height * width
+        video_output = concat_features[:, :video_seq_len]
+        
+        # Reshape back to spatial-temporal format
+        video_spatial = self.unpatchify(video_output, time_steps, height, width)
+        
+        # Final projection to output space
+        output = self.output_proj(video_spatial)
+        
+        return output
+
+
+class DualStreamBlock(nn.Module):
+    """
+    Dual stream block for processing video features independently from text.
+    """
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        dim_head=64,
+        dropout=0.0,
+        use_temporal_memory=True,
+        use_depth_aware_conv=False,
+        use_cross_attention=False,
+        context_dim=None
+    ):
+        super().__init__()
+        self.use_temporal_memory = use_temporal_memory
+        self.use_depth_aware_conv = use_depth_aware_conv
+        self.use_cross_attention = use_cross_attention
+        
+        # Self-attention with RoPE
+        self.attention = SelfAttentionBlock(
+            dim=dim,
+            num_heads=num_heads,
+            dim_head=dim_head,
+            dropout=dropout
+        )
+        
+        # Optional cross-attention
+        if use_cross_attention and context_dim is not None:
+            self.cross_attention = CrossAttentionBlock(
+                query_dim=dim,
+                context_dim=context_dim,
+                heads=num_heads,
+                dim_head=dim_head,
+                dropout=dropout
+            )
+            self.norm2 = nn.LayerNorm(dim)
+        
+        # Feed-forward network
+        self.ffn = FeedForward(dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
+        
+        # Optional temporal memory
+        if use_temporal_memory:
+            self.temporal_memory = DiffusionMemory(
+                channels=dim,
+                memory_length=16
+            )
+        
+        # Optional depth-aware processing
+        if use_depth_aware_conv:
+            self.depth_block = DepthAwareConv(
+                in_channels=dim,
+                out_channels=dim
+            )
+        
+        # Global context conditioning
+        self.global_cond = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, dim)
+        ) if context_dim is not None else None
+        
+    def forward(
+        self,
+        x,
+        time_emb,
+        t_idx, h_idx, w_idx,
+        depth_maps=None,
+        global_context=None
+    ):
+        # Self-attention with RoPE
+        h = self.norm1(x)
+        h = self.attention(h, t_idx, h_idx, w_idx)
+        x = x + h
+        
+        # Cross-attention (if enabled)
+        if self.use_cross_attention and hasattr(self, 'cross_attention'):
+            h = self.norm2(x)
+            h = self.cross_attention(h, global_context.unsqueeze(1) if global_context is not None else None)
+            x = x + h
+        
+        # Feed-forward network
+        h = self.norm3(x)
+        h = self.ffn(h)
+        x = x + h
+        
+        # Apply global conditioning (if provided)
+        if global_context is not None and self.global_cond is not None:
+            global_features = self.global_cond(global_context).unsqueeze(1)
+            x = x + global_features
+        
+        # Reshape for temporal memory and depth-aware processing
+        batch_size, seq_len, channels = x.shape
+        
+        if self.use_temporal_memory or self.use_depth_aware_conv:
+            # Inference time: need to infer dimensions
+            time_steps = int(seq_len ** (1/3))
+            height = width = int((seq_len / time_steps) ** 0.5)
+            
+            # Reshape to spatial-temporal format
+            x_spatial = einops.rearrange(
+                x,
+                'b (t h w) c -> b c t h w',
+                t=time_steps, h=
