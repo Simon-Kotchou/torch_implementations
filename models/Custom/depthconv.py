@@ -211,3 +211,66 @@ class DepthAwareTemporalBlock(nn.Module):
         temp_out = self.temporal_conv(temp_features)
         
         return temp_out
+    
+class DepthAwareUNetBlock(nn.Module):
+    """
+    U-Net block incorporating both depth awareness and temporal consistency
+    for video diffusion models.
+    """
+    def __init__(self, in_channels, out_channels, time_emb_dim=None, is_video=True):
+        super().__init__()
+        self.is_video = is_video
+        
+        if is_video:
+            self.main_block = DepthAwareTemporalBlock(in_channels, out_channels, time_emb_dim)
+        else:
+            self.main_block = DepthAwareResBlock(in_channels, out_channels, time_emb_dim)
+            
+    def forward(self, x, depth_maps, time_emb=None):
+        """
+        Forward pass through the UNet block.
+        
+        Args:
+            x: Input features - [B, C, T, H, W] for video or [B, C, H, W] for image
+            depth_maps: Depth maps - [B, T, 1, H, W] for video or [B, 1, H, W] for image  
+            time_emb: Optional diffusion timestep embeddings
+        """
+        if self.is_video:
+            return self.main_block(x, depth_maps, time_emb)
+        else:
+            return self.main_block(x, depth_maps, time_emb)
+
+
+# Test function
+def test_depth_aware_modules():
+    # Test depth-aware convolution
+    batch_size, channels, height, width = 4, 64, 32, 32
+    x = torch.randn(batch_size, channels, height, width)
+    depth_map = torch.rand(batch_size, 1, height, width)
+    
+    depth_conv = DepthAwareConv(channels, channels * 2)
+    out = depth_conv(x, depth_map)
+    print(f"Depth-aware conv output shape: {out.shape}")
+    
+    # Test depth-aware block with time embeddings
+    time_emb_dim = 256
+    time_emb = torch.randn(batch_size, time_emb_dim)
+    
+    depth_block = DepthAwareResBlock(channels, channels * 2, time_emb_dim)
+    out = depth_block(x, depth_map, time_emb)
+    print(f"Depth-aware block output shape: {out.shape}")
+    
+    # Test temporal version with multiple frames
+    time_steps = 8
+    x_video = torch.randn(batch_size, channels, time_steps, height, width)
+    depth_maps_video = torch.rand(batch_size, time_steps, 1, height, width)
+    
+    temporal_block = DepthAwareTemporalBlock(channels, channels * 2, time_emb_dim)
+    out = temporal_block(x_video, depth_maps_video, time_emb)
+    print(f"Temporal depth-aware block output shape: {out.shape}")
+    
+    return out
+
+
+if __name__ == "__main__":
+    test_depth_aware_modules()
