@@ -217,7 +217,7 @@ class HunyuanVideoDiffusionModel(nn.Module):
     def device(self):
         return next(self.parameters()).device
     
-        def forward(
+    def forward(
         self, 
         x, 
         timesteps, 
@@ -424,4 +424,32 @@ class DualStreamBlock(nn.Module):
             x_spatial = einops.rearrange(
                 x,
                 'b (t h w) c -> b c t h w',
-                t=time_steps, h=
+                t=time_steps, h=height, w=width
+            )
+            
+            # Apply temporal memory
+            if self.use_temporal_memory:
+                x_spatial = self.temporal_memory(x_spatial)
+            
+            # Apply depth-aware processing
+            if self.use_depth_aware_conv and depth_maps is not None:
+                # Process each frame with depth awareness
+                outputs = []
+                for t in range(time_steps):
+                    frame = x_spatial[:, :, t]  # [B, C, H, W]
+                    depth = depth_maps[:, t]    # [B, 1, H, W]
+                    
+                    # Apply depth-aware processing
+                    out_t = self.depth_block(frame, depth)
+                    outputs.append(out_t)
+                
+                # Stack processed frames
+                x_spatial = torch.stack(outputs, dim=2)  # [B, C, T, H, W]
+            
+            # Reshape back to sequence format
+            x = einops.rearrange(
+                x_spatial,
+                'b c t h w -> b (t h w) c'
+            )
+            
+        return x
