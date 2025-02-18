@@ -108,3 +108,155 @@ class DiffusionMemory(nn.Module):
         """Reset the memory bank - useful between video sequences"""
         self.memory_bank.zero_()
         self.memory_idx = 0
+
+class TemporalAttention(nn.Module):
+    """
+    Temporal attention mechanism for global feature propagation across frames.
+    Implements a simplified version of the transformer attention blocks from SAM 2.
+    """
+    def __init__(self, channels, num_heads=8):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        assert self.head_dim * num_heads == channels, "channels must be divisible by num_heads"
+        
+        # QKV projections
+        self.q_proj = nn.Conv3d(channels, channels, kernel_size=1)
+        self.k_proj = nn.Conv3d(channels, channels, kernel_size=1)
+        self.v_proj = nn.Conv3d(channels, channels, kernel_size=1)
+        self.out_proj = nn.Conv3d(channels, channels, kernel_size=1)
+        
+        # Learnable temporal positional embedding
+        self.time_pos_emb = nn.Parameter(torch.zeros(1, channels, 16, 1, 1))
+        
+    def forward(self, x):
+        """
+        Forward pass through temporal attention.
+        
+        Args:
+            x: Input tensor of shape [B, C, T, H, W]
+        
+        Returns:
+            Attention-enhanced features
+        """
+        batch, channels, time, height, width = x.shape
+        
+        # Add positional embeddings (truncate or expand as needed)
+        pos_emb = self.time_pos_emb[:, :, :time]
+        if time > pos_emb.shape[2]:
+            # Handle longer sequences through interpolation
+            pos_emb = F.interpolate(
+                pos_emb, 
+                size=(time, 1, 1), 
+                mode='trilinear', 
+                align_corners=False
+            )
+        
+        x_pos = x + pos_emb
+        
+        # Project to queries, keys, values
+        q = self.q_proj(x_pos)
+        k = self.k_proj(x_pos)
+        v = self.v_proj(x_pos)
+        
+        # Reshape for multi-head attention
+        q = einops.rearrange(q, 'b (h d) t h w -> b h t (h w) d', h=self.num_heads)
+        k = einops.rearrange(k, 'b (h d) t h w -> b h t (h w) d', h=self.num_heads)
+        v = einops.rearrange(v, 'b (h d) t h w -> b h t (h w) d', h=self.num_heads)
+        
+        # Compute attention scores (scaled dot-product attention)
+        scale = self.head_dim ** -0.5
+        attn = torch.einsum('bhtpd,bhtqd->bhtpq', q, k) * scale
+        
+        # Attention weights
+        attn = F.softmax(attn, dim=-1)
+        
+        # Apply attention to values
+        out = torch.einsum('bhtpq,bhtqd->bhtpd', attn, v)
+        
+        # Reshape back to original format
+        out = einops.rearrange(out, 'b h t (h w) d -> b (h d) t h w', h=height, w=width)
+        
+        # Final projection
+        out = self.out_proj(out)
+        
+        return out
+
+
+# Full integration with U-Net for video diffusion
+class VideoUNetBlock(nn.Module):
+    """
+    U-Net block with integrated temporal memory for video diffusion models.
+    """
+    def __init__(self, in_channels, out_channels, time_emb_dim):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, out_channels)
+        )
+        
+        # Main convolution blocks
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(32, out_channels)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(32, out_channels)
+        self.act = nn.SiLU()
+        
+        # Temporal memory integration
+        self.memory = DiffusionMemory(channels=out_channels)
+        
+        # Skip connection if needed
+        self.residual = nn.Identity() if in_channels == out_channels else nn.Conv3d(in_channels, out_channels, 1)
+        
+    def forward(self, x, t_emb):
+        """
+        Forward pass incorporating temporal memory and timestep embeddings.
+        
+        Args:
+            x: Input feature maps [B, C, T, H, W]
+            t_emb: Timestep embeddings [B, D]
+        """
+        # Main path
+        h = self.act(self.norm1(self.conv1(x)))
+        
+        # Add time embeddings
+        t = self.time_mlp(t_emb)
+        t = einops.rearrange(t, 'b c -> b c 1 1 1')
+        h = h + t
+        
+        # Second conv
+        h = self.act(self.norm2(self.conv2(h)))
+        
+        # Apply temporal memory
+        h = self.memory(h)
+        
+        # Skip connection
+        return h + self.residual(x)
+
+
+# Example usage
+def test_memory_module():
+    # Create sample input: [batch, channels, time, height, width]
+    x = torch.randn(2, 256, 8, 64, 64)
+    
+    # Initialize memory module
+    memory = DiffusionMemory(channels=256)
+    
+    # Forward pass
+    output = memory(x)
+    
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {output.shape}")
+    
+    # Test single frame inference
+    single_frame = torch.randn(2, 256, 1, 64, 64)
+    memory.eval()
+    output_single = memory(single_frame)
+    print(f"Single frame output shape: {output_single.shape}")
+    
+    return output
+
+
+if __name__ == "__main__":
+    test_memory_module()
