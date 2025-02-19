@@ -120,11 +120,25 @@ class NoiseUtils:
         Returns:
             Noisy samples at timestep t
         """
-        # Reshape t for broadcasting
+        # Handle scalar t
+        if isinstance(t, (int, float)):
+            t = torch.tensor([t], device=x_start.device)
+            
+        # Ensure t is a tensor
+        if not isinstance(t, torch.Tensor):
+            t = torch.tensor(t, device=x_start.device)
+            
+        # Handle single value
+        if t.dim() == 0:
+            t = t.view(1)
+            
+        # Reshape t for broadcasting based on input dimensions
         if len(x_start.shape) == 2:  # For 2D data
             t = t.view(-1, 1)
-        else:  # For video data
+        elif len(x_start.shape) == 5:  # For video data
             t = t.view(-1, 1, 1, 1, 1)
+        else:  # For image data or other shapes
+            t = t.view(*([t.shape[0]] + [1] * (len(x_start.shape) - 1)))
             
         # Linear interpolation between start and noise
         # t=1 is all signal, t=0 is all noise
