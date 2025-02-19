@@ -1,11 +1,8 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from sklearn.datasets import make_moons, make_circles, make_swiss_roll
-import matplotlib.cm as cm
+from sklearn.datasets import make_moons, make_circles
 from tqdm import tqdm
-import math
 
 # Set random seeds for reproducibility
 np.random.seed(42)
@@ -13,13 +10,12 @@ torch.manual_seed(42)
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
 def sinusoidal_embedding(t, dim=64):
-    """
-    Sinusoidal embedding for timestep t
-    """
+    """Sinusoidal embedding for timestep t"""
     half = dim // 2
-    freqs = torch.exp(-torch.arange(half, dtype=torch.float32) * math.log(10000) / half).to(device)
+    freqs = torch.exp(-torch.arange(half, dtype=torch.float32) * np.log(10000) / half)
     args = t[:, None] * freqs[None]
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
     if dim % 2:
@@ -27,9 +23,7 @@ def sinusoidal_embedding(t, dim=64):
     return embedding
 
 class FlowNetwork(torch.nn.Module):
-    """
-    Neural network for modeling flow fields
-    """
+    """Neural network for modeling flow fields"""
     def __init__(self, input_dim=2, hidden_dim=128, time_dim=64):
         super().__init__()
         self.time_embed = torch.nn.Sequential(
@@ -61,121 +55,10 @@ class FlowNetwork(torch.nn.Module):
         return velocity
 
 def linear_interpolation(x_0, x_1, t):
-    """
-    Linear interpolation between x_0 and x_1 at time t
-    """
-    return t * x_1 + (1 - t) * x_0
+    """Linear interpolation between x_0 and x_1 at time t"""
+    return (1-t) * x_0 + t * x_1
 
-def create_flow_matching_animation(source, target, flow_network=None, num_frames=100, num_trajectories=1000):
-    """
-    Create animation of flow matching between source and target distributions
-    
-    Args:
-        source: Source distribution points [N, 2]
-        target: Target distribution points [N, 2]
-        flow_network: Optional trained flow network
-        num_frames: Number of frames in animation
-        num_trajectories: Number of trajectories to show
-    
-    Returns:
-        Animation object
-    """
-    # Subsample points for clearer visualization
-    indices = np.random.choice(len(source), num_trajectories, replace=False)
-    source_sub = source[indices]
-    target_sub = target[indices]
-    
-    # Create figure
-    fig, ax = plt.subplots(figsize=(10, 10))
-    plt.tight_layout()
-    
-    # Initialize scatter plot
-    scatter = ax.scatter([], [], s=5, c=[], cmap='viridis', alpha=0.8)
-    quiver = ax.quiver([], [], [], [], color='red', alpha=0.5, scale=30)
-    title = ax.set_title('')
-    
-    # Set axes limits with some padding
-    all_points = torch.cat([source, target], dim=0)
-    x_min, y_min = all_points.min(dim=0)[0].numpy() - 0.5
-    x_max, y_max = all_points.max(dim=0)[0].numpy() + 0.5
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_aspect('equal')
-    
-    # Create colormap for time
-    colors = cm.viridis(np.linspace(0, 1, num_trajectories))
-    
-    # Function to initialize animation
-    def init():
-        scatter.set_offsets(np.empty((0, 2)))
-        quiver.set_offsets(np.empty((0, 2)))
-        quiver.set_UVC(np.empty(0), np.empty(0))
-        return scatter, quiver, title
-    
-    # Function to update animation for each frame
-    def update(frame):
-        t = frame / (num_frames - 1)
-        t_tensor = torch.tensor([t], device=device)
-        
-        # Get current positions through interpolation or flow
-        if flow_network is None:
-            # Simple linear interpolation
-            current = linear_interpolation(source_sub, target_sub, t)
-            # Compute analytical velocity (target - source)
-            velocity = target_sub - source_sub
-        else:
-            # Use flow network for velocity
-            with torch.no_grad():
-                t_batch = t_tensor.repeat(len(source_sub))
-                current = source_sub.clone().to(device)
-                
-                # Get velocity from flow network
-                velocity = flow_network(current, t_batch)
-                velocity = velocity.cpu()
-                current = current.cpu()
-        
-        # Update scatter plot
-        scatter.set_offsets(current.numpy())
-        scatter.set_array(np.arange(len(current)))
-        
-        # Update velocity vectors (show a subset for clarity)
-        if t < 0.99:  # Don't show vectors at final state
-            subsample = min(100, len(current))
-            idx = np.random.choice(len(current), subsample, replace=False)
-            
-            quiver.set_offsets(current[idx].numpy())
-            quiver.set_UVC(velocity[idx, 0].numpy(), velocity[idx, 1].numpy())
-        else:
-            quiver.set_offsets(np.empty((0, 2)))
-            quiver.set_UVC(np.empty(0), np.empty(0))
-            
-        title.set_text(f't = {t:.2f}')
-        return scatter, quiver, title
-    
-    # Create animation
-    animation = FuncAnimation(
-        fig, update, frames=num_frames, init_func=init, blit=True, interval=50
-    )
-    
-    return animation
-
-def generate_spirals(n_samples=1000, noise=0.1):
-    """Generate two interlocking spirals"""
-    n = np.sqrt(np.random.rand(n_samples)) * 780 * (2 * np.pi) / 360
-    d1x = -np.cos(n) * n + np.random.rand(n_samples) * noise
-    d1y = np.sin(n) * n + np.random.rand(n_samples) * noise
-    spiral1 = np.vstack([d1x, d1y]).T
-    
-    n = np.sqrt(np.random.rand(n_samples)) * 780 * (2 * np.pi) / 360
-    d2x = np.cos(n) * n + np.random.rand(n_samples) * noise
-    d2y = -np.sin(n) * n + np.random.rand(n_samples) * noise
-    spiral2 = np.vstack([d2x, d2y]).T
-    
-    spiral = np.vstack([spiral1, spiral2])
-    spiral = spiral / (spiral.max() / 2) - 1
-    return torch.tensor(spiral, dtype=torch.float32)
-
-def generate_distributions(dataset='spirals', n_samples=2000):
+def generate_distributions(dataset='moons', n_samples=2000):
     """Generate source and target distributions"""
     # Source: Gaussian noise
     source = torch.randn(n_samples, 2)
@@ -187,27 +70,20 @@ def generate_distributions(dataset='spirals', n_samples=2000):
     elif dataset == 'circles':
         target_np, _ = make_circles(n_samples=n_samples, noise=0.05, factor=0.5)
         target = torch.tensor(target_np, dtype=torch.float32)
-    elif dataset == 'spirals':
-        target = generate_spirals(n_samples=n_samples)
-    elif dataset == 'swiss_roll':
-        target_np, _ = make_swiss_roll(n_samples=n_samples, noise=0.05)
-        target = torch.tensor(target_np[:, [0, 2]], dtype=torch.float32)
-        # Normalize swiss roll
-        target = target / 5.0
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
     
     return source, target
 
-def train_flow_model(source, target, steps=1000, lr=1e-3):
-    """
-    Train a flow matching model to transform source to target
-    """
+def train_flow_model(source, target, steps=500, lr=1e-3):
+    """Train a flow matching model to transform source to target"""
     flow_network = FlowNetwork().to(device)
     optimizer = torch.optim.Adam(flow_network.parameters(), lr=lr)
     
     source = source.to(device)
     target = target.to(device)
+    
+    losses = []
     
     # Training loop
     for step in tqdm(range(steps), desc="Training flow model"):
@@ -227,41 +103,128 @@ def train_flow_model(source, target, steps=1000, lr=1e-3):
         
         # Compute loss
         loss = torch.mean((v_pred - v_t) ** 2)
+        losses.append(loss.item())
         
         # Backpropagation
         loss.backward()
         optimizer.step()
         
-    return flow_network
+    return flow_network, losses
 
-def visualize_transformations():
-    """Create flow matching visualizations for different datasets"""
-    datasets = ['moons', 'circles', 'spirals']
+def visualize_flow_field(flow_network, source, target, num_steps=10, save_path=None):
+    """Visualize the flow field and sample trajectories"""
+    # Set up the plot
+    plt.figure(figsize=(15, 15))
+    
+    # Determine plot boundaries
+    all_points = torch.cat([source, target], dim=0)
+    x_min, y_min = all_points.min(dim=0)[0].numpy() - 0.5
+    x_max, y_max = all_points.max(dim=0)[0].numpy() + 0.5
+    
+    # Time steps to visualize
+    timesteps = np.linspace(0, 1, num_steps)
+    
+    # Number of rows and columns in the grid
+    n_rows = int(np.ceil(np.sqrt(num_steps)))
+    n_cols = int(np.ceil(num_steps / n_rows))
+    
+    # Sample a subset of points for clearer visualization
+    n_viz_points = 500
+    indices = np.random.choice(len(source), n_viz_points, replace=False)
+    source_viz = source[indices].to(device)
+    target_viz = target[indices].to(device)
+    
+    # Track positions through time
+    current_positions = source_viz.clone()
+    
+    # Grid for computing vector field
+    resolution = 20
+    x_grid = np.linspace(x_min, x_max, resolution)
+    y_grid = np.linspace(y_min, y_max, resolution)
+    X, Y = np.meshgrid(x_grid, y_grid)
+    grid_points = np.column_stack([X.ravel(), Y.ravel()])
+    grid_tensor = torch.tensor(grid_points, dtype=torch.float32).to(device)
+    
+    for i, t in enumerate(timesteps):
+        ax = plt.subplot(n_rows, n_cols, i+1)
+        
+        # Plot source and target distributions
+        if i == 0:
+            plt.scatter(source[:, 0].cpu().numpy(), source[:, 1].cpu().numpy(), 
+                      s=1, alpha=0.3, color='blue', label='Source')
+        elif i == num_steps-1:
+            plt.scatter(target[:, 0].cpu().numpy(), target[:, 1].cpu().numpy(), 
+                      s=1, alpha=0.3, color='red', label='Target')
+        
+        # Compute vector field at this timestep
+        t_tensor = torch.ones(len(grid_tensor), device=device) * t
+        with torch.no_grad():
+            grid_velocities = flow_network(grid_tensor, t_tensor).cpu().numpy()
+        
+        # Reshape velocities for quiver plot
+        U = grid_velocities[:, 0].reshape(resolution, resolution)
+        V = grid_velocities[:, 1].reshape(resolution, resolution)
+        
+        # Plot vector field
+        plt.quiver(X, Y, U, V, alpha=0.5, color='gray')
+        
+        # If not the first step, advance particles
+        if i > 0:
+            # Get velocities at current positions
+            with torch.no_grad():
+                velocities = flow_network(current_positions, torch.ones_like(indices, device=device).float() * (t-timesteps[1]+timesteps[0]))
+            
+            # Euler integration step
+            current_positions = current_positions + velocities * (timesteps[1]-timesteps[0])
+        
+        # Plot current positions
+        position_np = current_positions.cpu().numpy()
+        plt.scatter(position_np[:, 0], position_np[:, 1], s=5, color='green', alpha=0.7)
+        
+        # Set title and axis limits
+        plt.title(f't = {t:.2f}')
+        plt.xlim(x_min, x_max)
+        plt.ylim(y_min, y_max)
+        
+        if i == 0 or i == num_steps-1:
+            plt.legend()
+    
+    plt.tight_layout()
+    
+    # Save or show the plot
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved visualization to {save_path}")
+    else:
+        plt.show()
+
+def main():
+    datasets = ['moons', 'circles']
+    
     for dataset in datasets:
-        print(f"Creating visualization for {dataset} dataset...")
+        print(f"\nVisualizing flow matching for {dataset} dataset...")
         
         # Generate distributions
         source, target = generate_distributions(dataset=dataset)
         
         # Train flow model
-        flow_network = train_flow_model(source, target, steps=500)
+        flow_network, losses = train_flow_model(source, target)
         
-        # Create animation
-        animation = create_flow_matching_animation(
-            source, target, flow_network=flow_network, num_frames=50
-        )
+        # Plot loss curve
+        plt.figure(figsize=(8, 5))
+        plt.plot(losses)
+        plt.yscale('log')
+        plt.xlabel('Training Steps')
+        plt.ylabel('MSE Loss (log scale)')
+        plt.title(f'Flow Matching Training Loss - {dataset.capitalize()}')
+        plt.grid(alpha=0.3)
+        plt.savefig(f'flow_loss_{dataset}.png', dpi=150, bbox_inches='tight')
         
-        # Save animation
-        animation.save(f'flow_matching_{dataset}.gif', writer='pillow', fps=10, dpi=100)
-        print(f"Saved animation to flow_matching_{dataset}.gif")
+        # Visualize flow field
+        visualize_flow_field(flow_network, source, target, num_steps=12, 
+                           save_path=f'flow_matching_{dataset}.png')
         
-        # Also create a linear interpolation animation for comparison
-        animation_linear = create_flow_matching_animation(
-            source, target, flow_network=None, num_frames=50
-        )
-        animation_linear.save(f'linear_interpolation_{dataset}.gif', writer='pillow', fps=10, dpi=100)
-        print(f"Saved linear interpolation to linear_interpolation_{dataset}.gif")
-        
+    print("\nAll visualizations completed!")
+
 if __name__ == "__main__":
-    print(f"Using device: {device}")
-    visualize_transformations()
+    main()
