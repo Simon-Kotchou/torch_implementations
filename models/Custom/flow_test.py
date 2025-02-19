@@ -217,10 +217,16 @@ print(f"Using device: {device}")
 class SimpleVideoUNet(nn.Module):
     def __init__(self, in_channels=3, out_channels=3, time_dim=32, feature_dim=128):
         super().__init__()
+        self.time_dim = time_dim
+        self.feature_dim = feature_dim
+        
+        # Time embedding - match dimensions with feature maps
         self.time_embedding = nn.Sequential(
             nn.Linear(time_dim, feature_dim),
             nn.SiLU(),
-            nn.Linear(feature_dim, feature_dim)
+            nn.Linear(feature_dim, feature_dim),
+            nn.SiLU(),
+            nn.Linear(feature_dim, feature_dim*2)  # Match mid-layer dimension
         )
         
         # Downsampling
@@ -240,7 +246,7 @@ class SimpleVideoUNet(nn.Module):
         
     def forward(self, x, timesteps):
         # Embed time
-        t_emb = NoiseUtils.get_noise_level_embedding(timesteps, 32)
+        t_emb = NoiseUtils.get_noise_level_embedding(timesteps, self.time_dim)
         t_emb = self.time_embedding(t_emb)
         
         # Downsample
@@ -250,7 +256,7 @@ class SimpleVideoUNet(nn.Module):
         # Middle with time embedding
         x2 = self.mid1(x2)
         # Add time embedding to each spatial location
-        t_emb = t_emb.view(-1, t_emb.shape[1], 1, 1, 1)
+        t_emb = t_emb.view(-1, self.feature_dim*2, 1, 1, 1)
         x2 = x2 + t_emb
         x2 = F.silu(x2)
         x2 = F.silu(self.mid2(x2))
