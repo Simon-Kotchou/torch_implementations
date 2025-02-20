@@ -305,4 +305,214 @@ def train_rectified_flow(continuous_ae, data, batch_size=32, steps=50000,
     # Get latent dimensions from autoencoder output
     with torch.no_grad():
         # Use a small batch to determine dimensions
-        sample_batch = torch.tensor(data[:2], dtype=torch.float32).to(
+        sample_batch = torch.tensor(data[:2], dtype=torch.float32).to(device)
+        latent = continuous_ae.encode(sample_batch)
+        latent_shape = latent.shape[1:]  # [C, H, W]
+        
+    # Create model
+    flow_model = RectifiedFlowTransformer(
+        input_dim=latent_shape[0],
+        spatial_dims=(latent_shape[1], latent_shape[2]),
+        embed_dim=768,
+        depth=12,
+        num_heads=12
+    ).to(device)
+    
+    # Setup optimizer with weight decay
+    optimizer = torch.optim.AdamW(
+        flow_model.parameters(),
+        lr=lr,
+        weight_decay=1e-5,
+        betas=(0.9, 0.99)
+    )
+    
+    # Cosine learning rate scheduler with linear warmup
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        total_steps=steps,
+        pct_start=0.1,
+        div_factor=25,
+        final_div_factor=10,
+        anneal_strategy='cos'
+    )
+    
+    # Setup data loader
+    data_tensor = torch.tensor(data, dtype=torch.float32)
+    dataset = torch.utils.data.TensorDataset(data_tensor)
+    dataloader = torch.utils.data.DataLoader(
+        dataset, 
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=4
+    )
+    
+    # Training metrics
+    losses = {
+        'total': [],
+        'velocity_mse': [],
+        'velocity_norm': [],
+        'reg_loss': []
+    }
+    
+    # Create checkpoint directory
+    import os
+    os.makedirs('checkpoints', exist_ok=True)
+    
+    # Start training
+    flow_model.train()
+    global_step = 0
+    epoch = 0
+    running_loss = 0.0
+    
+    progress_bar = tqdm(total=steps, desc="Training rectified flow")
+    
+    try:
+        while global_step < steps:
+            epoch += 1
+            for batch_idx, (images,) in enumerate(dataloader):
+                if global_step >= steps:
+                    break
+                    
+                images = images.to(device)
+                batch_size = images.shape[0]
+                
+                # Get continuous latent vectors from autoencoder
+                with torch.no_grad():
+                    z1 = continuous_ae.encode(images)
+                
+                # Sample random noise
+                z0 = torch.randn_like(z1)
+                
+                # Sample random timesteps in (0,1)
+                t = torch.rand(batch_size, device=device)
+                
+                # Construct point along the trajectory with linear interpolation
+                zt = t.view(-1, 1, 1, 1) * z1 + (1 - t.view(-1, 1, 1, 1)) * z0
+                
+                # True velocity field
+                v_target = z1 - z0
+                
+                # Predict velocity field
+                v_pred = flow_model(zt, t)
+                
+                # Compute Loss
+                velocity_mse = F.mse_loss(v_pred, v_target)
+                
+                # Regularization losses
+                velocity_norm = torch.mean(torch.norm(v_pred.view(batch_size, -1), dim=1))
+                reg_scale = min(1.0, global_step / (steps * 0.3)) * 1e-4
+                reg_loss = reg_scale * velocity_norm
+                
+                # Total loss
+                loss = velocity_mse + reg_loss
+                
+                # Optimization step
+                optimizer.zero_grad()
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(flow_model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                scheduler.step()
+                
+                # Update metrics
+                running_loss += loss.item()
+                losses['total'].append(loss.item())
+                losses['velocity_mse'].append(velocity_mse.item())
+                losses['velocity_norm'].append(velocity_norm.item())
+                losses['reg_loss'].append(reg_loss.item())
+                
+                # Update progress
+                global_step += 1
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'v_mse': f"{velocity_mse.item():.4f}",
+                    'lr': f"{scheduler.get_last_lr()[0]:.6f}"
+                })
+                
+                # Save checkpoint and visualize periodically
+                if global_step % 1000 == 0 or global_step == steps:
+                    # Save checkpoint
+                    torch.save({
+                        'step': global_step,
+                        'model_state_dict': flow_model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': loss.item(),
+                    }, f'checkpoints/rectified_flow_step_{global_step}.pt')
+                    
+                    # Save latest checkpoint
+                    torch.save({
+                        'step': global_step,
+                        'model_state_dict': flow_model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': loss.item(),
+                    }, 'checkpoints/rectified_flow_latest.pt')
+                    
+                    # Report metrics
+                    avg_loss = running_loss / 1000
+                    print(f"\nStep {global_step}: Average loss = {avg_loss:.6f}")
+                    running_loss = 0.0
+                    
+                    # Visualize loss curves if we have enough data
+                    if len(losses['total']) > 100:
+                        plot_training_curves(losses, global_step)
+        
+        # Training finished
+        print(f"Training completed after {epoch} epochs, {global_step} steps")
+        
+        # Final checkpoint
+        torch.save({
+            'step': global_step,
+            'model_state_dict': flow_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': running_loss / (global_step % 1000),
+            'losses': losses,
+        }, 'checkpoints/rectified_flow_final.pt')
+        
+    except KeyboardInterrupt:
+        print("Training interrupted. Saving checkpoint...")
+        torch.save({
+            'step': global_step,
+            'model_state_dict': flow_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': running_loss / (global_step % 1000 + 1),
+            'losses': losses,
+        }, 'checkpoints/rectified_flow_interrupted.pt')
+    
+    return flow_model, losses
+
+def plot_training_curves(losses, step):
+    """Plot training curves for the rectified flow model"""
+    import matplotlib.pyplot as plt
+    
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.plot(losses['total'][-5000:])
+    plt.title('Total Loss')
+    plt.xlabel('Step')
+    plt.yscale('log')
+    plt.grid(alpha=0.3)
+    
+    plt.subplot(1, 3, 2)
+    plt.plot(losses['velocity_mse'][-5000:])
+    plt.title('Velocity MSE')
+    plt.xlabel('Step')
+    plt.yscale('log')
+    plt.grid(alpha=0.3)
+    
+    plt.subplot(1, 3, 3)
+    plt.plot(losses['velocity_norm'][-5000:])
+    plt.title('Velocity Norm')
+    plt.xlabel('Step')
+    plt.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'checkpoints/rectified_flow_loss_step_{step}.png', dpi=150)
+    plt.close()
