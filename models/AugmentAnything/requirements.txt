@@ -1,0 +1,25 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+
+# SAM2 (Segment Anything Model 2)
+sam2>=0.1.0
+
+# FAISS for fast similarity search
+# Use faiss-cpu by default, install faiss-gpu separately for GPU acceleration
+faiss-cpu>=1.7.4
+
+# Image processing
+opencv-python>=4.7.0
+pillow>=9.5.0
+
+# Scientific computing
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# Utilities
+tqdm>=4.65.0
+
+# These are needed for DINOv3 embeddings and compression
+pycocotools>=2.0.6
