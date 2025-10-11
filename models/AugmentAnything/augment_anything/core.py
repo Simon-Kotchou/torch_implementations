@@ -21,11 +21,20 @@ from pathlib import Path
 from typing import Optional, List, Tuple, Union, Callable
 import pickle
 import gzip
+import logging
 from tqdm import tqdm
 import faiss
 from dataclasses import dataclass
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+
+# Set up logging
+logger = logging.getLogger(__name__)
+
+# Constants
+MIN_MASK_PIXELS = 10  # Minimum mask pixels for valid descriptor computation
+MAX_SEARCH_CANDIDATES = 50  # Number of candidates to retrieve from FAISS
+MIN_BLUR_KERNEL_SIZE = 3  # Minimum kernel size for Gaussian blur
 
 
 @dataclass
@@ -86,8 +95,25 @@ class AugmentAnything:
         config: Optional[AugmentConfig] = None,
         cache_name: Optional[str] = None
     ):
+        """
+        Initialize AugmentAnything.
+
+        Args:
+            image_dir: Directory containing images
+            config: Configuration object
+            cache_name: Custom cache name (defaults to directory name)
+
+        Raises:
+            ValueError: If image_dir doesn't exist or is not a directory
+        """
         self.config = config or AugmentConfig()
         self.image_dir = Path(image_dir)
+
+        # Validate image directory
+        if not self.image_dir.exists():
+            raise ValueError(f"Image directory does not exist: {self.image_dir}")
+        if not self.image_dir.is_dir():
+            raise ValueError(f"Path is not a directory: {self.image_dir}")
 
         # Set cache path
         if self.config.cache_dir and self.config.auto_cache:
@@ -100,11 +126,11 @@ class AugmentAnything:
 
         # Try loading from cache
         if self.cache_path and self.cache_path.exists():
-            print(f"Loading from cache: {self.cache_path}")
+            logger.info(f"Loading from cache: {self.cache_path}")
             self._load_cache()
         else:
             # Build from scratch
-            print("Initializing AugmentAnything...")
+            logger.info("Initializing AugmentAnything...")
             self._init_models()
             self._build_database()
 
@@ -113,7 +139,7 @@ class AugmentAnything:
 
     def _init_models(self):
         """Initialize SAM2 model"""
-        print(f"Loading SAM2: {self.config.sam_model}")
+        logger.info(f"Loading SAM2: {self.config.sam_model}")
         self.predictor = SAM2ImagePredictor.from_pretrained(self.config.sam_model)
         self.predictor.model.to(self.config.device)
 
@@ -130,7 +156,7 @@ class AugmentAnything:
         """Build segment database from image directory"""
         # Load images
         image_files = self._find_images()
-        print(f"Found {len(image_files)} images")
+        logger.info(f"Found {len(image_files)} images")
 
         self.image_data = []
         all_descriptors = []
@@ -181,11 +207,11 @@ class AugmentAnything:
         descriptors_array = np.array(all_descriptors).astype('float32')
         self.feature_dim = descriptors_array.shape[1]
 
-        print(f"Building FAISS index with {len(all_descriptors)} segments...")
+        logger.info(f"Building FAISS index with {len(all_descriptors)} segments...")
         self.index = faiss.IndexFlatIP(self.feature_dim)
         self.index.add(descriptors_array)
 
-        print(f"✓ Database ready: {len(self.image_data)} images, {len(self.segments)} segments")
+        logger.info(f"✓ Database ready: {len(self.image_data)} images, {len(self.segments)} segments")
 
     def _find_images(self) -> List[Path]:
         """Find all images in directory"""
@@ -216,7 +242,7 @@ class AugmentAnything:
             return features, masks
 
         except Exception as e:
-            print(f"Error processing image: {e}")
+            logger.warning(f"Error processing image: {e}")
             return None, []
 
     def _compute_descriptor(self, features, mask):
@@ -239,7 +265,7 @@ class AugmentAnything:
         ) > 0.5
 
         # Masked pooling
-        if mask_resized.sum() > 10:
+        if mask_resized.sum() > MIN_MASK_PIXELS:
             descriptor = features[:, mask_resized].mean(axis=1)
         else:
             descriptor = features.mean(axis=(1, 2))
@@ -269,14 +295,34 @@ class AugmentAnything:
 
         Returns:
             augmented image (and optionally swap info)
+
+        Raises:
+            ValueError: If image is invalid or num_swaps is negative
+            FileNotFoundError: If image path doesn't exist
         """
+        # Validate num_swaps
+        if not isinstance(num_swaps, int) or num_swaps < 0:
+            raise ValueError(f"num_swaps must be non-negative integer, got {num_swaps}")
+
         if seed is not None:
             np.random.seed(seed)
 
         # Load image if path
         if isinstance(image, (str, Path)):
-            img = cv2.imread(str(image))
+            img_path = Path(image)
+            if not img_path.exists():
+                raise FileNotFoundError(f"Image not found: {img_path}")
+            img = cv2.imread(str(img_path))
+            if img is None:
+                raise ValueError(f"Failed to load image: {img_path}")
             image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Validate numpy array input
+        if isinstance(image, np.ndarray):
+            if image.ndim != 3 or image.shape[2] != 3:
+                raise ValueError(f"Expected RGB image (H, W, 3), got shape {image.shape}")
+            if image.dtype != np.uint8:
+                raise ValueError(f"Expected uint8 image, got dtype {image.dtype}")
 
         # Extract features and masks for this image
         features, masks = self._extract_features_and_masks(image)
@@ -301,11 +347,12 @@ class AugmentAnything:
             if match is None:
                 continue
 
-            # Blend the matched segment
-            target_img = self.image_data[match['img_idx']]['image']
-            target_mask = match['mask']
+            # Extract the matched segment region from database image
+            db_img = self.image_data[match['img_idx']]['image']
+            db_mask = match['mask']
 
-            augmented = self._blend_segment(augmented, target_img, source_mask, target_mask)
+            # Blend the matched segment into target
+            augmented = self._blend_segment(augmented, db_img, source_mask, db_mask)
 
             swap_info.append({
                 'source_mask': source_mask,
@@ -319,7 +366,7 @@ class AugmentAnything:
         """Find best matching segment using FAISS"""
         # Search
         query = source_descriptor.reshape(1, -1).astype('float32')
-        similarities, indices = self.index.search(query, k=50)
+        similarities, indices = self.index.search(query, k=MAX_SEARCH_CANDIDATES)
 
         # Get source properties
         source_bbox = self._mask_to_bbox(source_mask)
@@ -363,35 +410,79 @@ class AugmentAnything:
         return [coords[0].min(), coords[1].min(), coords[0].max(), coords[1].max()]
 
     def _blend_segment(self, target_img, source_img, target_mask, source_mask):
-        """Blend source segment into target"""
-        H, W = target_img.shape[:2]
+        """
+        Blend source segment into target.
 
-        # Resize source if needed
-        if source_mask.shape != (H, W):
-            source_mask = cv2.resize(
-                source_mask.astype(np.uint8), (W, H),
-                interpolation=cv2.INTER_NEAREST
-            ).astype(bool)
+        Args:
+            target_img: Target image to paste into (query image)
+            source_img: Source image to extract from (database image)
+            target_mask: Where to paste in target (query mask location)
+            source_mask: What to extract from source (matched segment mask)
 
-        if source_img.shape[:2] != (H, W):
-            source_img = cv2.resize(source_img, (W, H))
+        Returns:
+            Blended image with source segment in target location
+        """
+        H_tgt, W_tgt = target_img.shape[:2]
+        result = target_img.copy()
 
-        # Create smooth blend mask
-        blend_mask = target_mask.astype(np.float32)
-        blend_mask = cv2.GaussianBlur(
-            blend_mask,
-            (self.config.blend_kernel_size, self.config.blend_kernel_size),
-            self.config.blend_sigma
-        )
+        # 1. Extract bbox regions
+        source_bbox = self._mask_to_bbox(source_mask)  # [y1, x1, y2, x2]
+        target_bbox = self._mask_to_bbox(target_mask)
+
+        # Handle empty masks
+        if source_bbox == [0, 0, 0, 0] or target_bbox == [0, 0, 0, 0]:
+            return result
+
+        sy1, sx1, sy2, sx2 = source_bbox
+        ty1, tx1, ty2, tx2 = target_bbox
+
+        # Extract source region and mask
+        source_region = source_img[sy1:sy2+1, sx1:sx2+1]
+        source_mask_region = source_mask[sy1:sy2+1, sx1:sx2+1]
+
+        # Get target dimensions
+        target_h = ty2 - ty1 + 1
+        target_w = tx2 - tx1 + 1
+
+        # 2. Resize source region to match target size
+        source_region_resized = cv2.resize(source_region, (target_w, target_h))
+        source_mask_resized = cv2.resize(
+            source_mask_region.astype(np.uint8),
+            (target_w, target_h),
+            interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
+
+        # Extract target region mask
+        target_mask_region = target_mask[ty1:ty2+1, tx1:tx2+1]
+
+        # 3. Create blend mask (intersection of source and target masks)
+        combined_mask = (target_mask_region.astype(np.float32) *
+                        source_mask_resized.astype(np.float32))
+
+        # Apply Gaussian blur for smooth blending
+        blend_mask = combined_mask
+        if self.config.blend_kernel_size > 0:
+            kernel_size = min(self.config.blend_kernel_size,
+                            min(target_h, target_w) // 2 * 2 + 1)  # Ensure odd and <= region size
+            if kernel_size >= MIN_BLUR_KERNEL_SIZE:
+                blend_mask = cv2.GaussianBlur(
+                    blend_mask,
+                    (kernel_size, kernel_size),
+                    self.config.blend_sigma
+                )
         blend_mask = np.clip(blend_mask, 0, 1)[:, :, np.newaxis]
 
-        # Blend
-        result = (blend_mask * source_img + (1 - blend_mask) * target_img).astype(np.uint8)
+        # 4. Blend source region into target at target_bbox location
+        target_region = result[ty1:ty2+1, tx1:tx2+1]
+        blended_region = (blend_mask * source_region_resized +
+                         (1 - blend_mask) * target_region).astype(np.uint8)
+        result[ty1:ty2+1, tx1:tx2+1] = blended_region
+
         return result
 
     def _save_cache(self):
         """Save database to cache"""
-        print(f"Saving cache to {self.cache_path}...")
+        logger.info(f"Saving cache to {self.cache_path}...")
 
         # Save FAISS index
         faiss.write_index(self.index, str(self.cache_path.with_suffix('.faiss')))
@@ -414,10 +505,10 @@ class AugmentAnything:
         with gzip.open(self.cache_path.with_suffix('.pkl.gz'), 'wb') as f:
             pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-        print("✓ Cache saved")
+        logger.info("✓ Cache saved")
 
     def _load_cache(self):
-        """Load database from cache"""
+        """Load database from cache with path remapping support"""
         # Load FAISS index
         self.index = faiss.read_index(str(self.cache_path.with_suffix('.faiss')))
 
@@ -425,17 +516,42 @@ class AugmentAnything:
         with gzip.open(self.cache_path.with_suffix('.pkl.gz'), 'rb') as f:
             cache_data = pickle.load(f)
 
-        # Reconstruct image_data (reload images)
+        # Reconstruct image_data (reload images with path remapping)
         self.image_data = []
+        missing_images = []
+
         for d in cache_data['image_data']:
-            img = cv2.imread(d['path'])
+            cached_path = Path(d['path'])
+
+            # Try original path first
+            img_path = cached_path
+            img = cv2.imread(str(img_path))
+
+            # If original path doesn't work, try remapping to current image_dir
+            if img is None and not cached_path.exists():
+                # Try finding file by name in current image_dir
+                potential_path = self.image_dir / cached_path.name
+                if potential_path.exists():
+                    img = cv2.imread(str(potential_path))
+                    img_path = potential_path
+                    logger.info(f"  Remapped: {cached_path.name} -> {potential_path}")
+
             if img is not None:
                 self.image_data.append({
-                    'path': Path(d['path']),
+                    'path': img_path,
                     'image': cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
                     'masks': d['masks'],
                     'features': d['features']
                 })
+            else:
+                missing_images.append(str(cached_path))
+
+        if missing_images:
+            logger.warning(f"Could not load {len(missing_images)} images:")
+            for path in missing_images[:5]:  # Show first 5
+                logger.warning(f"  - {path}")
+            if len(missing_images) > 5:
+                logger.warning(f"  ... and {len(missing_images) - 5} more")
 
         self.segments = cache_data['segments']
         self.feature_dim = cache_data['feature_dim']
@@ -444,7 +560,25 @@ class AugmentAnything:
         # Reinitialize SAM2 for augmentation
         self._init_models()
 
-        print(f"✓ Loaded from cache: {len(self.image_data)} images, {len(self.segments)} segments")
+        logger.info(f"✓ Loaded from cache: {len(self.image_data)} images, {len(self.segments)} segments")
+
+    def cleanup(self):
+        """Explicitly cleanup GPU resources."""
+        if hasattr(self, 'predictor') and hasattr(self.predictor, 'model'):
+            self.predictor.model.cpu()
+            del self.predictor
+        if hasattr(self, 'mask_generator'):
+            del self.mask_generator
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("Resources cleaned up")
+
+    def __del__(self):
+        """Cleanup resources on deletion."""
+        try:
+            self.cleanup()
+        except:
+            pass  # Silently ignore errors during cleanup
 
 
 class AugmentAnythingDataset(Dataset):

@@ -38,6 +38,7 @@ dependencies = [
     "matplotlib>=3.7.0",
     "pillow>=9.5.0",
     "tqdm>=4.65.0",
+    "pycocotools>=2.0.6",
 ]
 
 [project.optional-dependencies]
@@ -59,9 +60,8 @@ Repository = "https://github.com/simon-kotchou/augment-anything"
 "Bug Tracker" = "https://github.com/simon-kotchou/augment-anything/issues"
 
 [project.scripts]
-augment-anything = "augment_anything:main"
-augment-faiss = "faiss_augment:main"
-augment-build-db = "faiss_ds:main"
+augment-anything = "augment_anything.core:main"
+augment-build-db = "augment_anything.faiss_ds:main"
 
 [tool.setuptools]
 packages = ["augment_anything"]
