@@ -49,9 +49,8 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "augment-anything=augment_anything:main",
-            "augment-faiss=faiss_augment:main",
-            "augment-build-db=faiss_ds:main",
+            "augment-anything=augment_anything.core:main",
+            "augment-build-db=augment_anything.faiss_ds:main",
         ],
     },
     include_package_data=True,
