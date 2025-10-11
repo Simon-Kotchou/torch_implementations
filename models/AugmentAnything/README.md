@@ -248,6 +248,46 @@ blur_sigma = 7                    # Gaussian blur sigma
 - Best results with datasets containing similar object categories
 - Blending may be visible on highly textured backgrounds
 
+## Testing
+
+A comprehensive test suite is available in the `tests/` directory.
+
+### Running Tests
+
+Install development dependencies:
+```bash
+pip install -e ".[dev]"
+```
+
+Run all tests:
+```bash
+pytest
+```
+
+Run with coverage:
+```bash
+pytest --cov=augment_anything --cov-report=html
+```
+
+Skip slow integration tests:
+```bash
+pytest -m "not slow"
+```
+
+Skip model download tests (useful for CI/CD):
+```bash
+SKIP_MODEL_TESTS=true pytest
+```
+
+### Test Structure
+
+- `test_core.py` - Unit tests for core augmentation functionality
+- `test_faiss_ds.py` - Unit tests for database builder
+- `test_integration.py` - End-to-end integration tests
+- `conftest.py` - Shared fixtures and test utilities
+
+Tests use mocking to avoid model downloads and run quickly in CI/CD environments.
+
 ## License
 
 MIT License - See LICENSE file for details
