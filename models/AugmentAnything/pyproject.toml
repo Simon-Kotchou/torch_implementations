@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "augment-anything"
+version = "0.1.0"
+description = "Intelligent data augmentation using SAM2 for semantic-aware image synthesis"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Simon Kotchou", email = "simonkotchou@mines.edu"}
+]
+keywords = ["data-augmentation", "computer-vision", "sam2", "semantic-segmentation", "faiss"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "transformers>=4.30.0",
+    "sam2>=0.1.0",
+    "faiss-cpu>=1.7.4",
+    "opencv-python>=4.7.0",
+    "numpy>=1.24.0",
+    "matplotlib>=3.7.0",
+    "pillow>=9.5.0",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "flake8>=6.0",
+    "isort>=5.0",
+]
+gpu = [
+    "faiss-gpu>=1.7.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/simon-kotchou/augment-anything"
+Documentation = "https://github.com/simon-kotchou/augment-anything#readme"
+Repository = "https://github.com/simon-kotchou/augment-anything"
+"Bug Tracker" = "https://github.com/simon-kotchou/augment-anything/issues"
+
+[project.scripts]
+augment-anything = "augment_anything:main"
+augment-faiss = "faiss_augment:main"
+augment-build-db = "faiss_ds:main"
+
+[tool.setuptools]
+packages = ["augment_anything"]
+
+[tool.setuptools.package-data]
+augment_anything = ["*.md", "examples/*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311"]
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
