@@ -1,0 +1,39 @@
+# Include documentation
+include README.md
+include LICENSE
+include CLAUDE.md
+
+# Include requirements
+include requirements.txt
+
+# Include configuration files
+include pyproject.toml
+include setup.py
+
+# Include examples
+recursive-include examples *.py *.md *.jpg *.png
+
+# Include assets (images, media, etc.)
+recursive-include assets *.jpg *.jpeg *.png *.gif *.mp4 *.webm *.svg
+
+# Exclude development and build files
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store
+global-exclude *.so
+global-exclude .git*
+global-exclude .vscode
+global-exclude .idea
+
+# Exclude cache and output directories
+recursive-exclude cache *
+recursive-exclude outputs *
+recursive-exclude results *
+recursive-exclude augment_results *
+recursive-exclude segment_db *
+
+# Exclude model checkpoints
+global-exclude *.pt
+global-exclude *.pth
+global-exclude *.ckpt
+global-exclude *.safetensors
